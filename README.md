@@ -1,4 +1,4 @@
-# Personal agent
+# Personal agent - A side project
 
 A personal Telegram-fronted AI assistant. Reads Gmail, Notion, Google Calendar, and local files. Routes messages to specialist agents (workout, lifestyle, career) and remembers your history. Framework free agent loop.
 
