@@ -1,0 +1,23 @@
+# Personal Goals
+# Copy this file to goals.md and fill in your own details.
+# goals.md is gitignored — it will never be committed.
+
+## Running Profile
+- Current max distance: X km
+- Current pace: X:XX/km
+- Runs per week: N
+
+## Race Goal
+- Event: [race name]
+- Date: [YYYY-MM-DD]
+- Target finish: [time] (~X:XX/km pace)
+- Strategy: [your strategy]
+
+## Training Plan
+- Schedule: N runs/week
+  - Short run: X–Y km (midweek)
+  - Long run: build from X km → Y km (weekends)
+
+## Other Goals
+- [Add any other goals — career, fitness, personal — the agents will surface
+  them when relevant. One goal per bullet is easiest for the agent to parse.]

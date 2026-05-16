@@ -1,0 +1,176 @@
+[
+  This file shows the schema of every audit event written to agent.log.json.
+  All values below are fictional placeholders — no real data.
+  The real agent.log.json is gitignored and never committed.
+
+  Records are pretty-printed JSON blocks separated by blank lines.
+  Fully jq-compatible:
+
+    jq 'select(.event=="tool_call" and .ok==false)' data/agent.log.json
+    jq 'select(.event=="route_decision")' data/agent.log.json
+    tail -f data/agent.log.json | jq -c '{event,agent,turn}'
+]
+
+{
+  "ts": "2026-01-01T09:00:00.000+00:00",
+  "event": "user_message",
+  "user_id": 123456789,
+  "text": "How was my sleep this week?"
+}
+
+{
+  "ts": "2026-01-01T09:00:00.050+00:00",
+  "event": "route_decision",
+  "input_preview": "How was my sleep this week?",
+  "result": { "type": "conversation", "agent": "workout", "category": "sleep" },
+  "had_context_hint": false
+}
+
+{
+  "ts": "2026-01-01T09:00:00.060+00:00",
+  "event": "dispatch",
+  "user_id": 123456789,
+  "type": "conversation",
+  "agent": "workout",
+  "category": "sleep",
+  "sticky_fallback": false,
+  "router_agent": "workout",
+  "last_agent": "workout"
+}
+
+{
+  "ts": "2026-01-01T09:00:00.070+00:00",
+  "event": "llm_call",
+  "user_id": 123456789,
+  "agent": "workout",
+  "turn": 0,
+  "model": "deepseek-v4-flash",
+  "temperature": 0.9,
+  "num_messages": 3,
+  "num_tools": 29,
+  "tool_choice": "auto",
+  "system_prompt_preview": "You are a personal workout coach...\n\n---\n\n## Today's date\nWednesday, January 1, 2026..."
+}
+
+{
+  "ts": "2026-01-01T09:00:01.200+00:00",
+  "event": "llm_response",
+  "user_id": 123456789,
+  "agent": "workout",
+  "turn": 0,
+  "duration_ms": 1130.4,
+  "has_tool_calls": true,
+  "text": "",
+  "text_len": 0,
+  "usage": { "prompt": 4200, "completion": 85, "total": 4285, "reasoning": null }
+}
+
+{
+  "ts": "2026-01-01T09:00:01.205+00:00",
+  "event": "tool_call",
+  "user_id": 123456789,
+  "turn": 0,
+  "name": "health_daily_summary",
+  "arguments": { "days": 7 },
+  "result": { "days": [ { "date": "20260101", "sleep_total_min": 432 } ] },
+  "ok": true,
+  "duration_ms": 3.1
+}
+
+{
+  "ts": "2026-01-01T09:00:02.800+00:00",
+  "event": "llm_response",
+  "user_id": 123456789,
+  "agent": "workout",
+  "turn": 1,
+  "duration_ms": 1595.0,
+  "has_tool_calls": false,
+  "text": "Your average sleep this week was 7.2 hours across 6 nights...",
+  "text_len": 312,
+  "usage": { "prompt": 5100, "completion": 210, "total": 5310, "reasoning": null }
+}
+
+{
+  "ts": "2026-01-01T09:00:02.810+00:00",
+  "event": "assistant_reply",
+  "user_id": 123456789,
+  "agent": "workout",
+  "text": "Your average sleep this week was 7.2 hours across 6 nights...",
+  "num_invocations": 1,
+  "staged_action_ids": []
+}
+
+{
+  "ts": "2026-01-01T09:05:00.000+00:00",
+  "event": "note_stored",
+  "user_id": 123456789,
+  "category": "workout",
+  "summary": "Completed upper body session, felt strong"
+}
+
+{
+  "ts": "2026-01-01T09:10:00.000+00:00",
+  "event": "llm_call",
+  "user_id": 123456789,
+  "agent": "general",
+  "turn": 0,
+  "model": "deepseek-v4-flash",
+  "temperature": 0.9,
+  "num_messages": 5,
+  "num_tools": 29,
+  "tool_choice": "auto",
+  "system_prompt_preview": "Today is Wednesday, January 1, 2026. You are a personal assistant..."
+}
+
+{
+  "ts": "2026-01-01T09:10:02.000+00:00",
+  "event": "tool_call",
+  "user_id": 123456789,
+  "turn": 0,
+  "name": "calendar_create_event",
+  "arguments": {
+    "title": "Long run",
+    "start": "2026-01-03T08:00:00",
+    "end": "2026-01-03T09:00:00",
+    "all_day": false
+  },
+  "result": {
+    "staged": true,
+    "action_id": "a3f8b2c1",
+    "preview": "Create event: Long run\nSat Jan 3, 08:00–09:00"
+  },
+  "ok": true,
+  "duration_ms": 18.5
+}
+
+{
+  "ts": "2026-01-01T09:10:05.000+00:00",
+  "event": "confirm",
+  "user_id": 123456789,
+  "action_id": "a3f8b2c1",
+  "tool": "calendar_create_event",
+  "arguments": {
+    "title": "Long run",
+    "start": "2026-01-03T08:00:00",
+    "end": "2026-01-03T09:00:00"
+  },
+  "ok": true,
+  "result": { "id": "abc123xyz", "link": "https://calendar.google.com/..." }
+}
+
+{
+  "ts": "2026-01-01T09:15:00.000+00:00",
+  "event": "cancel",
+  "user_id": 123456789,
+  "action_id": "b7c2d3e4",
+  "tool": "gmail_send_message"
+}
+
+{
+  "ts": "2026-01-01T09:20:00.000+00:00",
+  "event": "llm_error",
+  "user_id": 123456789,
+  "turn": 0,
+  "error": "APIConnectionError: Connection timeout",
+  "duration_ms": 30000.0
+}

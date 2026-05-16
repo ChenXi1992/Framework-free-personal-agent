@@ -1,0 +1,21 @@
+services:
+  agent:
+    build: .
+    image: me-agent:latest
+    container_name: me-agent
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Override the local-dev default in .env so the container writes to
+      # the mounted volume, regardless of what DB_PATH is set to on the host.
+      DB_PATH: /data/me.db
+    volumes:
+      - ./data:/data
+    # No ports published. Long-polling makes outbound HTTPS calls only,
+    # so the bot needs zero inbound network access.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sqlite3, os; sqlite3.connect(os.environ['DB_PATH']).execute('SELECT 1')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

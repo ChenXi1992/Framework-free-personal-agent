@@ -1,0 +1,28 @@
+# Personal Profile
+# Copy this file to personal_profile.md and fill in your own details.
+# personal_profile.md is gitignored — it will never be committed.
+#
+# The agent calls context_load("personal_profile.md") when it needs background
+# about you. Keep it factual and concise — bullet points work best.
+
+## General
+- Age: XX
+- Location: [city, country]
+- Languages: [list]
+
+## Physical
+- Height / Weight: XXXcm / XXkg
+- Fitness level: [beginner / intermediate / active]
+- Main sports: [e.g. running, climbing, cycling]
+
+## Work
+- Current role: [title at company/sector]
+- Background: [brief career summary, e.g. "3 yrs engineering → 5 yrs data science → PM"]
+
+## Habits & context
+- Diet: [any restrictions or preferences]
+- Schedule: [e.g. "works remotely", "early riser", "travels frequently"]
+- Partner / family: [optional — only add if relevant to lifestyle agent]
+
+## Anything else the agent should know
+- [Add any context that helps agents give better, more personalised answers]
