@@ -1,8 +1,22 @@
-# me-agent
+# Personal agent - A side project
+
 
 A personal Telegram-fronted AI assistant. Reads Gmail, Notion, Google Calendar, and local files. Routes messages to specialist agents (workout, lifestyle, growth, career, dutch) and remembers your history. Hand-rolled agent loop on top of DeepSeek's OpenAI-compatible API — no LangChain, no LlamaIndex, no framework.
 
-Designed to run on a local NAS or home server. Works just as well on a laptop or a $5/month VPS.
+Designed to run on a local NAS or home server. 
+
+The final goal is to build a personal assistant that store all the information about my daily life ( work, hobbies, lifestyle ), and ultimately makes decisions, provide feedback & automate certain tasks for me. 
+
+Currently: 
+- Access to Gmail, Calendar, Notion
+- Sub-agent: Career - auto reply email, workout coach, planning agent
+- Deepseek api only
+
+Next: 
+- Fine-tune the prompt 
+- Add diary part
+- Auto-summary & proactive agent
+- Deploy it by FastAPI ( Multi-access channel ) 
 
 ---
 
