@@ -16,6 +16,7 @@ Next:
 - Fine-tune the prompt ✅
 - Add diary category ✅
 - Auto-summary & proactive agent
+- Review the memory system 
 - Deploy it by FastAPI ( Multi-access channel ) 
 
 ---
