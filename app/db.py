@@ -40,8 +40,7 @@ CREATE TABLE IF NOT EXISTS notes (
     ts          INTEGER NOT NULL,
     created_at  TEXT    NOT NULL,          -- 'YYYY-MM-DD HH:MM:SS' UTC
     raw_text    TEXT    NOT NULL,
-    category    TEXT    NOT NULL
-                CHECK (category IN ('workout','lifestyle','career','uncategorized')),
+    category    TEXT    NOT NULL,          -- agent name or 'uncategorized' — no CHECK constraint so new agents work automatically
     summary     TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_notes_category_ts
@@ -173,6 +172,53 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _migrate_notes_categories(conn: sqlite3.Connection) -> None:
+    """Drop the hardcoded CHECK constraint from the notes.category column.
+
+    The original schema had CHECK (category IN ('workout','lifestyle',...)) which
+    breaks whenever a new agent is added. Since agents are now discovered
+    dynamically, the constraint is removed entirely — any string is a valid
+    category. This migration is a no-op once the constraint is gone.
+    """
+    notes_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='notes'"
+    ).fetchone()
+    old_row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='_notes_old'"
+    ).fetchone()
+
+    # Crash-recovery: a previous migration renamed notes → _notes_old but never
+    # finished (e.g. process killed mid-script). Restore the backup first.
+    if old_row and not notes_row:
+        conn.execute("ALTER TABLE _notes_old RENAME TO notes")
+        notes_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='notes'"
+        ).fetchone()
+
+    # If the CHECK constraint is gone already, nothing to do.
+    if notes_row and "CHECK" not in notes_row[0]:
+        return
+
+    conn.executescript("""
+        ALTER TABLE notes RENAME TO _notes_old;
+
+        CREATE TABLE notes (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts          INTEGER NOT NULL,
+            created_at  TEXT    NOT NULL,
+            raw_text    TEXT    NOT NULL,
+            category    TEXT    NOT NULL,
+            summary     TEXT    NOT NULL
+        );
+
+        INSERT INTO notes SELECT * FROM _notes_old;
+        DROP TABLE _notes_old;
+
+        CREATE INDEX IF NOT EXISTS idx_notes_category_ts
+            ON notes(category, ts);
+    """)
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """Add any missing timestamp columns and repair stale sentinel values.
 
@@ -217,6 +263,7 @@ def init() -> None:
     """Create tables and apply any pending schema migrations. Safe to call on every boot."""
     with _connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate_notes_categories(conn)
         _migrate(conn)
 
 

@@ -14,12 +14,15 @@ from .registry import tool
 from .pending import stage_action
 
 PROMPTS_DIR = Path(__file__).parent.parent.parent / "data" / "prompts"
-ALLOWED_PROMPTS = {"workout", "lifestyle", "career", "router", "classifier"}
+
+# Computed dynamically so new agent files are picked up on restart.
+from ..agents.discovery import get_agents as _get_agents  # noqa: E402
+ALLOWED_PROMPTS = set(_get_agents()) | {"router"}
 
 
 def _prompt_path(name: str) -> Path:
     if name not in ALLOWED_PROMPTS:
-        raise ValueError(f"Unknown prompt: {name!r}. Allowed: {ALLOWED_PROMPTS}")
+        raise ValueError(f"Unknown prompt: {name!r}. Allowed: {sorted(ALLOWED_PROMPTS)}")
     return PROMPTS_DIR / f"{name}.md"
 
 
@@ -129,7 +132,7 @@ def execute_confirmed(tool_name: str, arguments: dict[str, Any]) -> dict[str, An
         "properties": {
             "title":       {"type": "string", "description": "Short name for the needed capability."},
             "description": {"type": "string", "description": "What it would do and why it would help."},
-            "agent":       {"type": "string", "enum": ["workout", "lifestyle", "career", "general"]},
+            "agent":       {"type": "string", "enum": list(_get_agents()) + ["general"]},
             "example":     {"type": "string", "description": "Concrete example: 'When user asks X, I could Y.'"},
         },
         "required": ["title", "description", "agent"],

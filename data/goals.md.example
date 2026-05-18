@@ -1,11 +1,16 @@
-# Personal Goals
-# Copy this file to goals.md and fill in your own details.
-# goals.md is gitignored — it will never be committed.
+# Goals — folder structure
+# Goals are now split by domain. Copy the examples below into data/goals/<domain>.md
+# The entire data/goals/ folder is gitignored — your data stays local.
 
-## Running Profile
+# ── data/goals/workout.md ──────────────────────────────────────────────────────
+
+# Workout Goals
+
+## Runner Profile
 - Current max distance: X km
 - Current pace: X:XX/km
 - Runs per week: N
+- Other activities: [e.g. strength, cycling, bouldering]
 
 ## Race Goal
 - Event: [race name]
@@ -18,6 +23,45 @@
   - Short run: X–Y km (midweek)
   - Long run: build from X km → Y km (weekends)
 
-## Other Goals
-- [Add any other goals — career, fitness, personal — the agents will surface
-  them when relevant. One goal per bullet is easiest for the agent to parse.]
+
+# ── data/goals/growth.md ──────────────────────────────────────────────────────
+
+# Growth Goals
+
+## Personal Growth Goal
+- Goal: [e.g. build a stronger personal voice]
+- Noticed in: [where the pattern shows up]
+- Underlying fear / root cause: [honest reflection]
+- Status: [in progress / parked / done]
+
+
+# ── data/goals/lifestyle.md ───────────────────────────────────────────────────
+
+# Lifestyle Goals
+
+## [Habit name]
+- Goal: [specific target, e.g. ≤2.5 hrs screen time/day]
+- Baseline: [current level]
+- Why: [reason]
+- Exception: [any exceptions]
+
+
+# ── data/goals/career.md ──────────────────────────────────────────────────────
+
+# Career Goals
+
+## [Goal name]
+- Goal: [specific outcome]
+- Timeline: [date or milestone]
+- Current status: [where you are now]
+
+
+# ── data/goals/dutch.md ───────────────────────────────────────────────────────
+
+# Dutch Language Goals
+
+## Dutch Language Goal
+- Goal: Reach [level] Dutch proficiency
+- Target date: [date]
+- Current level: [e.g. A2]
+- Strategy: [how you plan to get there]

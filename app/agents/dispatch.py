@@ -1,14 +1,15 @@
 """Main dispatch entry point.
 
 Replaces the direct `llm.chat()` call in main.py for messages that go through
-the self-help agent system. Falls back to the default llm.chat() for 'general'
+the self-help agent system. Falls back to the default llm.chat() for chat
 messages with no specific agent.
 
 Flow:
     1. router.route(message) → {type, agent, category}
     2a. type == "note": classify → store note → optionally respond
-    2b. type in {conversation, task} with agent: build persona context → agent llm.chat()
-    2c. type == "general" or agent == "none": default llm.chat()
+    2b. type == "diary": build persona context → diary instruction → agent llm.chat()
+    2c. type == "chat" with agent: build persona context → agent llm.chat()
+    2d. agent == "none": default llm.chat()
 """
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import audit, db, debug_log
-from ..config import DEBUG_LOG_AGENT_PROMPT
+from ..config import DEBUG_LOG_AGENT_PROMPT, DIARY_DEFAULT_AGENT
 from ..db import _utc_now
 from ..llm import ChatResult, chat
 from . import router as _router
@@ -63,6 +64,15 @@ def _build_general_prompt() -> str:
         "When asked about personal data (emails, calendar, Notion pages, files), "
         "call the relevant tool instead of guessing or refusing.\n"
         "\n"
+        "## Tool honesty rule — CRITICAL\n"
+        "Your text responses NEVER change any data. Only tool calls do.\n"
+        "NEVER say something was saved, added, updated, or logged unless you actually "
+        "called the relevant tool in this same response and it returned ok.\n"
+        "If you want to add a todo item → call todo_add. "
+        "If you want to save a note → call note_add. "
+        "If you want to write a file → call file_write or file_append. "
+        "Saying 'Done!' without calling the tool is a lie — do not do it.\n"
+        "\n"
         "Destructive tools (calendar_create_event, gmail_send_message, etc.) stage the "
         "action and return a preview — nothing happens until the user confirms. "
         "IMPORTANT: call the tool NOW in your current turn — never say 'reply and I'll "
@@ -72,18 +82,33 @@ def _build_general_prompt() -> str:
     )
 
 
+# Only inherit the last agent if a conversation happened within this window.
+# Prevents stale inheritance — e.g. a workout conversation from this morning
+# should not pull in an unrelated "yes" response this evening.
+_STICKY_MAX_AGE_SECONDS = 3600  # 1 hour
+
+
 def _last_used_agent() -> str | None:
     """Return the name of the most recently active specialist agent, or None.
 
     Used to provide routing context for short, ambiguous follow-up messages
     (e.g. "Yes", "Sounds good", "Let's do it") that carry no agent signal on
     their own — the router needs to know what we were just talking about.
+
+    Only returns an agent if a conversation happened within _STICKY_MAX_AGE_SECONDS
+    (1 hour). Stale agent context from hours ago should not silently hijack a new
+    unrelated conversation.
     """
     with db._connect() as conn:
         row = conn.execute(
-            "SELECT agent FROM agent_conversations ORDER BY ts DESC LIMIT 1"
+            "SELECT agent, ts FROM agent_conversations ORDER BY ts DESC LIMIT 1"
         ).fetchone()
-    return row[0] if row else None
+    if not row:
+        return None
+    agent, ts = row
+    if (time.time() - ts) > _STICKY_MAX_AGE_SECONDS:
+        return None
+    return agent
 
 
 def handle(
@@ -110,7 +135,7 @@ def handle(
         if last_agent else ""
     )
     route = _router.route(user_message, recent_context=context_hint)
-    msg_type = route.get("type", "conversation")
+    msg_type = route.get("type", "chat")
     agent = route.get("agent", "none")
     category = route.get("category", "none")
 
@@ -148,9 +173,8 @@ def handle(
 
     # --- Note intake ---
     if msg_type == "note":
-        classified = _router.classify_note(user_message)
-        note_category = classified.get("category", "uncategorized")
-        note_summary = classified.get("summary", user_message[:80])
+        note_category = route.get("category", "uncategorized")
+        note_summary = route.get("summary") or user_message[:80]
 
         with db._connect() as conn:
             conn.execute(
@@ -171,6 +195,19 @@ def handle(
                 text=f"Got it — logged as {note_category}: {note_summary}"
             ), "none"
 
+    # --- Diary intake ---
+    # Diary entries are routed to the relevant agent, which is responsible for:
+    #   1. Calling diary_add (writes the raw narrative to diary.md)
+    #   2. Optionally calling note_add, todo_add, etc. to extract structured items
+    #   3. Responding to the user
+    # We don't pre-store anything here — the agent drives the whole flow via tools.
+    # When the router can't assign a specific agent (agent=="none"), we fall back to
+    # the lifestyle agent, since diary entries are almost always personal narrative.
+    if msg_type == "diary":
+        if agent == "none":
+            agent = DIARY_DEFAULT_AGENT
+            log.debug("Diary entry with no specific agent — defaulting to %s agent", agent)
+
     # --- General (no specific agent) ---
     if agent == "none":
         result = chat(global_history, user_id=user_id,
@@ -181,8 +218,26 @@ def handle(
     persona_prompt = _build_persona(agent, category)
     agent_history = _router.agent_message_history(agent, limit=20)
 
+    # For diary entries, prepend a hidden system note so the agent knows to call
+    # diary_add. Without this, the agent receives the same input as a normal
+    # conversation message and has no signal to write to diary.md.
+    if msg_type == "diary":
+        content_for_agent = (
+            "[Diary entry detected — follow this order:\n"
+            "1. Call diary_add() to write the narrative to diary.md.\n"
+            "2. Call note_add(category=<most relevant category>, summary=<one sentence>) "
+            "so the entry appears in your context on future calls. "
+            "Without this, the diary entry won't be visible in future conversations.\n"
+            "3. If any actionable items are present (todos, goals), call todo_add / "
+            "file_append as appropriate.\n"
+            "4. Then respond naturally.]\n\n"
+            + user_message
+        )
+    else:
+        content_for_agent = user_message
+
     # Merge: start from agent's own history, append the new user message.
-    messages_for_agent = [*agent_history, {"role": "user", "content": user_message}]
+    messages_for_agent = [*agent_history, {"role": "user", "content": content_for_agent}]
 
     result = chat(messages_for_agent, user_id=user_id,
                   system_prompt=persona_prompt, agent=agent)

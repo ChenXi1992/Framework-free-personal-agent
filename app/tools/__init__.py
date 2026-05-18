@@ -30,5 +30,5 @@ def _try(name: str) -> None:
         _log.debug("Tool module %r disabled: %s", name, e)
 
 
-for _name in ("context", "notion", "gmail", "calendar", "files", "notes", "prompts", "health"):
+for _name in ("context", "notion", "gmail", "calendar", "files", "notes", "prompts", "health", "diary", "todo"):
     _try(_name)

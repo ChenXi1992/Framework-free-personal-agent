@@ -29,7 +29,10 @@ data/me.db-wal
 # ── Personal data — fill in your own, see *.example files ─────────────────────
 data/personal_profile.md
 data/goals.md
+data/goals/
 data/health_summary.md
+data/diary.md
+data/todo.md
 
 # ── Runtime logs — generated at runtime, never commit ─────────────────────────
 data/agent.log.json

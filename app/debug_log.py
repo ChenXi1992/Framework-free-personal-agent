@@ -7,7 +7,6 @@ Unlike audit.py (which always runs and truncates long fields), this log:
 
 Each component is controlled by its own env var in config.py:
   DEBUG_LOG_ROUTER        → debug_router_call events
-  DEBUG_LOG_CLASSIFIER    → debug_classifier_call events
   DEBUG_LOG_AGENT_PROMPT  → debug_agent_prompt events
   DEBUG_LOG_LLM_RESPONSE  → debug_llm_response events
   DEBUG_LOG_REASONING     → debug_reasoning events

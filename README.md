@@ -1,6 +1,6 @@
 # me-agent
 
-A personal Telegram-fronted AI assistant. Reads Gmail, Notion, Google Calendar, and local files. Routes messages to specialist agents (workout, lifestyle, career) and remembers your history. Hand-rolled agent loop on top of DeepSeek's OpenAI-compatible API — no LangChain, no LlamaIndex, no framework.
+A personal Telegram-fronted AI assistant. Reads Gmail, Notion, Google Calendar, and local files. Routes messages to specialist agents (workout, lifestyle, growth, career, dutch) and remembers your history. Hand-rolled agent loop on top of DeepSeek's OpenAI-compatible API — no LangChain, no LlamaIndex, no framework.
 
 Designed to run on a local NAS or home server. Works just as well on a laptop or a $5/month VPS.
 
@@ -10,10 +10,19 @@ Designed to run on a local NAS or home server. Works just as well on a laptop or
 
 - **Read your stuff.** Search Gmail, read Notion pages, list calendar events, read local text files.
 - **Write your stuff.** Append to Notion, compose drafts, create calendar events, edit files — gated behind a two-step confirmation flow for anything destructive.
-- **Specialist agents.** A workout agent with access to your Huawei Health history; a lifestyle agent; a career agent. Each has its own memory, persona, and context.
-- **Note intake.** Anything classified as a "note" is stored and surfaces back to the relevant agent as context.
-- **Stays out of your way.** No inbound ports (long polling). No manual confirmation typing (`confirm` works, no slash, no action_id).
+- **Specialist agents.** Drop a `.md` file into `data/prompts/` and the agent is live on next restart — no code changes. Five built-in agents:
+  - **workout** — training coach with access to Huawei Health history and Google Calendar
+  - **lifestyle** — tracks observable behaviours: diet, sleep schedule, screen time, gaming
+  - **growth** — inner-life coach for emotions, self-reflection, personal development
+  - **career** — professional development, meeting notes, career goals
+  - **dutch** — Dutch language teacher with pain-point tracking
+- **Note intake.** Anything logged as a note is categorised, stored, and automatically surfaced as context to the relevant agent on future calls.
+- **Diary.** Personal journal entries stored in `diary.md` and indexed in the notes table so agents can reference them.
+- **Todo list.** `todo_add`, `todo_done`, `todo_list` backed by `data/todo.md`.
+- **Goals files.** Goals are split by domain in `data/goals/` (`workout.md`, `growth.md`, `lifestyle.md`, `career.md`, `dutch.md`). Each specialist agent owns and updates its own file via staged file operations.
+- **Stays out of your way.** No inbound ports (long polling). No manual confirmation typing — `confirm` works, no slash, no action_id. Typos (`confirn`) and emoji (`confirm :)`) are handled.
 - **Audit trail.** JSON log of every user message, LLM call, tool invocation, and confirmation.
+- **Hallucination guard.** If the LLM claims to have saved something but called no write tool, a visible warning is appended to the reply.
 
 ---
 
@@ -26,14 +35,20 @@ Telegram (long polling — no inbound ports)
    app/main.py
    - allow-list auth
    - /start /reset /confirm /cancel /tools
-   - "confirm" / "cancel" plain-text shortcuts
+   - fuzzy "confirm" shortcut (handles typos, emoji, "yes")
+   - hallucination guard (regex check on reply vs tool calls)
    - assembles reply (debug header + LLM text + staged-action footer)
          │
          ▼
-   app/agents/dispatch.py         ← Pass 1: classify user message
+   app/agents/dispatch.py         ← Pass 1: classify + route
    - router.route(msg) → {type, agent, category}
-   - note intake → db.notes
-   - builds persona + context for specialist agents
+   - types: note | diary | chat
+   - agents: discovered dynamically from data/prompts/ on startup
+   - agents: workout | lifestyle | growth | career | dutch | none
+   - note intake → db.notes (auto-stored + optional agent response)
+   - diary intake → agent writes diary.md + note_add for context visibility
+   - sticky fallback: short message + last agent within 1hr → inherit agent
+   - builds persona + context block for specialist agents
          │
          ▼
    app/llm.py                     ← Pass 2: tool-calling loop
@@ -46,7 +61,7 @@ Telegram (long polling — no inbound ports)
     ▼                ▼                         ▼
  app/tools/       app/tools/pending       app/audit.py
  registry.py      - SQLite staging         - JSON log
- - @tool decorator  queue
+ - @tool decorator  queue                  - every event
  - hides user_id    - /confirm executes
    from LLM schema  - /cancel discards
 
@@ -55,7 +70,10 @@ Tool integrations (all optional, import-guarded):
   gmail.py       — search, read, draft, trash, send (staged)
   calendar.py    — list, find-free, create (staged), delete (staged)
   files.py       — read, list, write (staged), edit (staged), append (staged)
-  notes.py       — note store, search, agent conversation memory, feedback
+  notes.py       — note store, search, agent memory, feedback
+  todo.py        — todo_add, todo_done, todo_list, todo_delete
+  diary.py       — diary_add, diary_recent
+  context.py     — context_list, context_load (on-demand file loading)
   prompts.py     — read/propose agent prompt files (staged), log tool needs
   health.py      — query Huawei Health data (steps, HR, sleep, workouts)
 ```
@@ -124,7 +142,7 @@ The token auto-refreshes. Scopes cover full Gmail + Calendar read/write.
 
 The agent can read, list, and write plain-text files. `FILES_ROOT` defaults to `data/` (the project's own data directory), so file reads and writes stay within the project by default. Set `FILES_ROOT` in `.env` to point at a different directory. Allowed extensions: `.md .txt .rst .csv .json .yaml .yml .toml .ini .cfg .log .html .xml`.
 
-Write/edit/append are staged — the user must confirm before bytes hit disk.
+Write/edit/append are staged — the user must confirm before bytes hit disk. Staged tools return a `{"staged": True, "action_id": …, "preview": …}` dict so the footer always appears.
 
 ### Huawei Health data
 
@@ -146,18 +164,26 @@ The workout agent then has access to:
 Every message is classified by a two-pass LLM call before it reaches the main agent loop.
 
 **Pass 1 — Router** (`data/prompts/router.md`): classifies `{type, agent, category}`.
-- `type`: `conversation`, `task`, or `note`
-- `agent`: `workout`, `lifestyle`, `career`, or `none`
-- `category`: finer-grained tag used for note retrieval
+
+| Field | Values |
+|---|---|
+| `type` | `note`, `diary`, `chat` |
+| `agent` | `workout`, `lifestyle`, `growth`, `career`, `dutch`, `none` |
+| `category` | domain tag for note storage — `workout`, `lifestyle`, `growth`, `career`, `dutch`, `uncategorized`, `none` |
 
 **Pass 2 — Dispatch** (`app/agents/dispatch.py`):
-- `note` → stored in `notes` table, optionally routed to agent for a response
-- `agent != none` → persona prompt + today's date + tool rules + recent notes + conversation memory injected; agent history used instead of global history
-- `agent == none` → general assistant with today's date + live tool list injected
+- `note` → router-generated summary stored to `notes` table, then optionally routes to agent for a response
+- `diary` → routed to agent (default: `growth`) with instructions to call `diary_add` + `note_add` + any action items
+- `agent != none` → persona prompt + today's date + tool rules + recent notes injected as system prompt; agent conversation history injected as messages
+- `agent == none` → general assistant with today's date + live tool list
 
-Context files (`goals.md`, `personal_profile.md`, etc.) are **not** auto-injected. The agent calls `context_list()` to see what exists and `context_load(filename)` for any file relevant to the question — loading only what's needed keeps token usage down.
+**Auto-injected context:** `personal_profile.md` and `goals/<agent>.md` are automatically included in every specialist agent's system prompt by `_build_agent_context()` — agents always know who Xi is and what their domain goals are without any tool call. Other `data/*.md` files are still loaded on demand via `context_list()` / `context_load()`.
 
-Agent persona files live in `data/prompts/` and can be edited. Agents can propose changes to their own prompts via `prompt_propose` (staged).
+**Sticky-agent fallback:** short messages (≤ 5 words) with `agent=none` inherit the last specialist agent — but only if that conversation happened **within the last hour**. Prevents a morning workout session from dragging into an unrelated evening conversation.
+
+Agent persona files live in `data/prompts/` and can be edited live. Agents can propose changes to their own prompts via `prompt_propose` (staged).
+
+**Adding a new agent:** create `data/prompts/<name>.md` with a `## Routing` section (one-liner describing the domain) and restart. The agent is automatically discovered, added to the router, and its category accepted in all tools — zero code changes required. Optionally add `data/goals/<name>.md` for domain-specific goals.
 
 ---
 
@@ -165,10 +191,12 @@ Agent persona files live in `data/prompts/` and can be edited. Agents can propos
 
 | What you type | What happens |
 |---|---|
+| *"I ran 10km today at 6:59/km"* | Logged as a workout note; workout agent responds with analysis |
+| *"Add to my goals: reduce screen time to 2.5hrs"* | Routed as chat → lifestyle agent → stages `file_append` to `goals/lifestyle.md` |
+| *"Ik wil Nederlands leren"* | Dutch agent corrects/responds; pain points tracked via notes |
 | *"What unread mail do I have?"* | `gmail_search` → summary |
-| *"Read my Notion page 'Q2 Goals'"* | `notion_search` + `notion_get_page` |
 | *"Send a one-line OOO to alex@example.com"* | `gmail_send_message` stages → preview shown |
-| `confirm` | Executes the most recent pending action |
+| `confirm` | Executes the most recent pending action (also: `confirn`, `confirm :)`) |
 | `cancel` | Discards the most recent pending action |
 | `/confirm <id>` | Confirm a specific staged action by ID |
 | `/cancel <id>` | Cancel a specific staged action by ID |
@@ -179,7 +207,7 @@ Agent persona files live in `data/prompts/` and can be edited. Agents can propos
 
 ## Staged actions (destructive tools)
 
-Tools that can't be undone (`gmail_send_message`, `notion_archive_page`, `calendar_create_event`, etc.) never execute immediately. They write to `pending_actions` in SQLite and return a preview.
+Tools that can't be undone (`gmail_send_message`, `notion_archive_page`, `calendar_create_event`, `file_write`, `file_edit`, `file_append`, etc.) never execute immediately. They write to `pending_actions` in SQLite and return a preview.
 
 Every reply that has a staged action gets an unconditional footer:
 
@@ -187,15 +215,13 @@ Every reply that has a staged action gets an unconditional footer:
 ⏳ STAGED — none of these have happened yet:
 
 [id: a3f8b2c1]
-Send email
-  To: alex@example.com
-  Subject: Quick question
-  Body: ...
-
+Write file: goals.md
+  Size: 312 characters
+  Preview: "## Career Goal\n- Goal: Transition to freelancing..."
 → /confirm a3f8b2c1   |   /cancel a3f8b2c1
 ```
 
-The footer is the source of truth — it appears regardless of what the LLM said in its text.
+The footer is the source of truth — it appears regardless of what the LLM said in its text reply. The footer is built directly from the tool's return value (`{"staged": True, "action_id": …}`), not from the LLM's description.
 
 ---
 
@@ -204,8 +230,7 @@ The footer is the source of truth — it appears regardless of what the LLM said
 **Debug mode** — set `LOG_LEVEL=DEBUG` in `.env`. Every reply gets a header:
 
 ```
-🔧 gmail_search(query="is:unread") → 3 result(s) [410ms]
-🔧 gmail_send_message(to="alex@...", subject="…") → staged a3f8b2c1 [18ms]
+🔧 file_append(path="goals/career.md", text="## Career Goal…") → staged a3f8b2c1 [4ms]
 ———
 <LLM reply>
 ———
@@ -221,11 +246,22 @@ tail -f data/agent.log.json | jq
 # All failed tool calls
 jq 'select(.event=="tool_call" and .ok==false)' data/agent.log.json
 
+# All routing decisions
+jq 'select(.event=="route_decision")' data/agent.log.json
+
+# Hallucination guard triggers
+jq 'select(.event=="warning")' data/agent.WARNING.json
+
 # Total tokens used today
 jq -s '[.[] | select(.event=="llm_response") | .usage.total] | add' data/agent.log.json
 ```
 
-Disable by setting `AUDIT_LOG_PATH=` (empty) in `.env`.
+Disable audit log by setting `AUDIT_LOG_PATH=` (empty) in `.env`.
+
+**Python log files** in `data/`:
+- `agent.INFO.json` — INFO-level messages only
+- `agent.WARNING.json` — WARNING messages (router failures, hallucination guard triggers)
+- `agent.ERROR.json` — errors with full tracebacks
 
 ---
 
@@ -248,11 +284,12 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com/v1  # swap to openai.com/v1 or a loca
 HISTORY_TURNS=20
 
 # LLM tuning
-AGENT_TEMPERATURE=0.9       # 0.0 = deterministic, 1.0 = most varied
+AGENT_TEMPERATURE=0.8       # 0.0 = deterministic, 1.0 = most varied
 MAX_TOOL_TURNS=10           # max tool-call iterations per user message
 
 # Optional
 FILES_ROOT=./data           # root for file tools (defaults to project data/ dir)
+DIARY_DEFAULT_AGENT=growth  # which agent handles diary entries when router returns agent=none
 NOTION_DATA_DIR=./data      # where notion_mcp_token.json is stored
 GMAIL_DATA_DIR=./data       # where gmail_credentials.json and gmail_token.json are stored
 ```
@@ -269,15 +306,23 @@ me-agent/
 ├── README.md
 ├── ARCHITECTURE.md                  ← codebase walkthrough for new developers
 ├── data/                            ← persisted data (partially gitignored)
-│   ├── goals.md                     ← Xi's personal goals (loaded on demand by agents)
-│   ├── personal_profile.md          ← Xi's profile (loaded on demand by agents)
+│   ├── goals/                       ← per-domain goals (gitignored)
+│   │   ├── workout.md
+│   │   ├── growth.md
+│   │   ├── lifestyle.md
+│   │   ├── career.md
+│   │   └── dutch.md
+│   ├── personal_profile.md          ← Xi's profile (auto-injected into every agent)
+│   ├── diary.md                     ← dated journal entries (written by diary_add)
+│   ├── todo.md                      ← todo list (managed by todo_add / todo_done)
 │   ├── health_summary.md            ← static health export (excluded from context_list)
-│   └── prompts/                     ← agent persona files (editable)
-│       ├── router.md
-│       ├── classifier.md
+│   └── prompts/                     ← agent persona files (editable live)
+│       ├── router.md                ← message type + agent classification + note summary prompt
 │       ├── workout.md
 │       ├── lifestyle.md
-│       └── career.md
+│       ├── growth.md
+│       ├── career.md
+│       └── dutch.md
 ├── scripts/
 │   └── process_health_data.py       ← one-time Huawei Health import
 └── app/
@@ -285,10 +330,12 @@ me-agent/
     ├── config.py                    ← env-var loading + validation
     ├── db.py                        ← SQLite schema (messages, notes, health tables…)
     ├── audit.py                     ← thread-safe JSONL audit logger
+    ├── debug_log.py                 ← optional full-fidelity debug log (LOG_LEVEL=DEBUG)
     ├── llm.py                       ← DeepSeek client + tool-calling loop
     ├── main.py                      ← Telegram bot entry point
     ├── agents/
     │   ├── __init__.py
+    │   ├── discovery.py             ← dynamic agent registry (scans data/prompts/)
     │   ├── dispatch.py              ← two-pass routing + agent persona builder
     │   └── router.py               ← LLM-based classifier + context assembly
     └── tools/
@@ -297,6 +344,8 @@ me-agent/
         ├── pending.py              ← staged-action queue
         ├── context.py              ← context_list / context_load (on-demand file loading)
         ├── notes.py                ← note store, agent memory, feedback
+        ├── todo.py                 ← todo list (backed by data/todo.md)
+        ├── diary.py                ← diary entries (backed by data/diary.md)
         ├── prompts.py              ← read/propose agent prompt files
         ├── health.py               ← Huawei Health query tools
         ├── notion.py               ← Notion MCP tools
@@ -312,8 +361,14 @@ me-agent/
 
 ## Lessons baked into the code
 
-- **`user_id` is hidden from LLM schemas.** If the model sees `user_id: integer` as a required parameter, it fills it in with a hallucinated number. The staged action then belongs to a phantom user and `/confirm` fails the ownership check. The agent loop injects it server-side after dispatch.
+- **`user_id` is hidden from LLM schemas.** If the model sees `user_id: integer` as a required parameter, it fills it in with a hallucinated number. The staged action then belongs to a phantom user and `/confirm` fails. The agent loop injects it server-side after dispatch.
+- **Staged tools return dicts, not strings.** `file_append` returns `{"staged": True, "action_id": …, "preview": …}`. The staged footer is built from this dict. If a tool returns a plain string, `isinstance(result, dict)` fails and the footer never fires — silent staging failure.
+- **Confirm shortcuts need fuzzy matching.** Users type `"confirn"`, `"confirm :)"`, `"CONFIRM!"`. Stripping only `.!?` misses emoji and typos. The normaliser strips all non-letter characters before matching, covering the real cases seen in production.
+- **Don't duplicate history in the system prompt.** `_build_agent_context()` previously included a truncated text digest of conversation history. This was removed because the same data is already passed as properly-formatted OpenAI messages. Double-injecting wastes tokens and can confuse the model with two slightly different versions.
+- **Sticky agent needs a recency window.** Without one, a morning workout conversation will silently pull in an unrelated "yes" from the evening. The 1-hour window means stale context expires naturally.
+- **Diary entries need `note_add` too.** `diary_add` writes to `diary.md` but the context block is built from the `notes` table. Without an explicit `note_add` call, diary content is invisible to future conversations.
+- **Hallucination guard needs a regex, not keywords.** A keyword list fires on `"I've noted your baseline"` or `"well done"`. A regex matching `I've saved`, `I added`, `I logged` only fires on explicit first-person write claims.
 - **DeepSeek thinking models return `reasoning_content`** which the API requires you to echo back on turn 2+, or you get HTTP 400. Using `msg.model_dump(exclude_none=True)` preserves all extra fields automatically.
 - **Notion MCP tokens expire hourly.** The `refresh_access_token()` function in `notion_auth.py` refreshes on 401 automatically; no manual re-auth needed.
 - **Huawei Health data ends in Feb 2023.** The `health_workout_sessions` tool uses `MAX(date)` from the table as the reference point rather than `date('now')`, so queries like "last 30 days" work correctly against historical data.
-- **The LLM is not a reliable narrator.** The staged-action footer is the structural source of truth for "what is pending" — shown unconditionally below the LLM's reply text.
+- **The LLM is not a reliable narrator.** The staged-action footer is the structural source of truth for "what is pending" — shown unconditionally below the LLM's reply text, built from tool return values, not from what the LLM said.

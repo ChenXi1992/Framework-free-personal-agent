@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,7 +27,7 @@ from telegram.ext import (
 )
 
 from . import audit
-from .config import ALLOWED_USERS, DEEPSEEK_MODEL, HISTORY_TURNS, LOG_LEVEL, MAX_TOOL_TURNS, TELEGRAM_BOT_TOKEN
+from .config import AGENT_TEMPERATURE, ALLOWED_USERS, DEEPSEEK_MODEL, HISTORY_TURNS, LOG_LEVEL, MAX_TOOL_TURNS, TELEGRAM_BOT_TOKEN
 from .db import init as db_init, log_message, recent_history
 from .llm import format_debug_header, format_staged_footer
 from .tools import pending  # ensures pending table is created
@@ -344,19 +345,30 @@ async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not text.strip():
         return
 
-    # Plain-text shortcuts: bare "confirm" / "cancel" (case-insensitive, with
-    # optional punctuation) act as /confirm or /cancel when a pending action
-    # exists. Saves the user from typing the slash + action_id every time.
-    # "yes confirm" is included because the agent sometimes replies "Reply
-    # 'yes confirm' to proceed" and users type it verbatim.
-    stripped = text.strip().lower().rstrip(".!?")
-    if stripped in ("confirm", "yes confirm") and pending.latest_pending_for(user_id):
-        ctx.args = []
-        await cmd_confirm(update, ctx)
+    # Plain-text shortcuts: "confirm" / "cancel" act as /confirm or /cancel.
+    # Normalise by stripping all non-letter characters (removes emoji, punctuation,
+    # trailing smileys like ":)") before matching, so "confirm :)" and "confirn"
+    # (common typo) both work. The set covers the typos seen in production logs.
+    _norm = re.sub(r"[^a-z ]", "", text.strip().lower()).strip()
+    _norm = " ".join(_norm.split())  # collapse whitespace
+
+    _CONFIRM_TRIGGERS = {"confirm", "confirn", "confim", "comfirm",
+                         "yes confirm", "yes confirn", "yes confim"}
+    _CANCEL_TRIGGERS  = {"cancel", "discard"}
+
+    if _norm in _CONFIRM_TRIGGERS:
+        if pending.latest_pending_for(user_id):
+            ctx.args = []
+            await cmd_confirm(update, ctx)
+        else:
+            await msg.reply_text("Nothing to confirm — no pending action found.")
         return
-    if stripped in ("cancel", "discard") and pending.latest_pending_for(user_id):
-        ctx.args = []
-        await cmd_cancel(update, ctx)
+    if _norm in _CANCEL_TRIGGERS:
+        if pending.latest_pending_for(user_id):
+            ctx.args = []
+            await cmd_cancel(update, ctx)
+        else:
+            await msg.reply_text("Nothing to cancel — no pending action found.")
         return
 
     log_message(user_id, "user", text)
@@ -375,6 +387,46 @@ async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         for i in result.invocations
         if isinstance(i.result, dict) and i.result.get("staged")
     ]
+
+    # Hallucination guard: detect when the agent claims to have written data
+    # but called no write tools.  This catches the failure mode where the LLM
+    # says "Done! Added to your todo list" without ever calling todo_add().
+    # We check invocations (ground truth) rather than trusting the reply text.
+    #
+    # Guard uses a regex instead of a keyword list to avoid false positives.
+    # Broad keywords like "noted", "done", "updated" fire on normal analysis
+    # replies ("I've noted your baseline", "well done").  The regex requires an
+    # explicit first-person claim of a completed write action:
+    #   "I saved …", "I've logged …", "I added …", "I recorded …", etc.
+    _write_tools = {
+        "todo_add", "note_add", "diary_add",
+        "file_write", "file_append", "file_edit",
+        "calendar_create_event", "gmail_send_message",
+        "notion_archive_page",
+    }
+    # Matches: "I saved", "I've saved", "I have saved", "I added", "I've logged", …
+    _CLAIM_RE = re.compile(
+        r"\bi(?:'ve|'ve|\s+have)?\s+(?:saved|added|logged|recorded|stored|written|appended)\b"
+    )
+    _tools_called = {inv.name for inv in result.invocations}
+    _write_tools_called = _tools_called & _write_tools
+    _reply_lower = result.text.lower()
+    _claims_write = bool(_CLAIM_RE.search(_reply_lower))
+
+    if _claims_write and not _write_tools_called and not staged_ids:
+        log.warning(
+            "Hallucination guard triggered: agent=%s claimed a write but called no write tools "
+            "(tools called: %s)",
+            routed_agent, _tools_called or "none",
+        )
+        result = result.__class__(
+            text=result.text + (
+                "\n\n⚠️ *Heads up: no data was actually saved in this response. "
+                "Ask me to try again if something was supposed to be stored.*"
+            ),
+            invocations=result.invocations,
+        )
+
     audit.log_event(
         "assistant_reply",
         user_id=user_id,
@@ -433,6 +485,29 @@ def _trim_after_reset(history: list[dict[str, str]]) -> list[dict[str, str]]:
 
 
 # ---------------------------------------------------------------------------
+# Telegram error handler
+# ---------------------------------------------------------------------------
+
+async def _telegram_error_handler(
+    update: object, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Log Telegram / network errors and notify the user when possible.
+
+    Without this, httpx.RemoteProtocolError and similar transient network
+    errors are silently swallowed and the user gets no response.
+    """
+    log.error("Telegram update error: %s", context.error, exc_info=context.error)
+    # Try to send a human-readable message so the user knows to retry.
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text(
+                "⚠️ Something went wrong on my end — please try again."
+            )
+    except Exception:  # noqa: BLE001
+        pass  # Don't let the error handler itself crash the loop
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
@@ -443,7 +518,7 @@ def main() -> None:
 
     # Startup summary — single place to confirm the bot is configured correctly.
     from .tools.registry import REGISTRY
-    log.info("Model: %s  temperature: %s  max_tool_turns: %s", DEEPSEEK_MODEL, os.environ.get("AGENT_TEMPERATURE", "0.9"), MAX_TOOL_TURNS)
+    log.info("Model: %s  temperature: %s  max_tool_turns: %s", DEEPSEEK_MODEL, AGENT_TEMPERATURE, MAX_TOOL_TURNS)
     log.info("Allowed users: %s", ALLOWED_USERS)
     log.info("Tools loaded (%d): %s", len(REGISTRY), ", ".join(sorted(REGISTRY)))
     log.info("Audit log: %s", audit.get_log_path())
@@ -458,6 +533,7 @@ def main() -> None:
     app.add_handler(CommandHandler("confirm", cmd_confirm))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
+    app.add_error_handler(_telegram_error_handler)
 
     log.info("Starting long-polling loop")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

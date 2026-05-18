@@ -1,0 +1,33 @@
+# Diary
+# This file shows the format used by data/diary.md.
+# All content below is fictional — no real data.
+# The real diary.md is gitignored and never committed.
+#
+# Entries are appended automatically when you send diary-type messages.
+# You can also edit this file manually in any text editor.
+# Each entry has a date+time header with optional #category tags,
+# followed by the entry body, separated by ---
+
+## 2026-01-01 09:15  #lifestyle #workout
+
+Started the year feeling pretty good. Did a 30-minute yoga session this morning
+and made a proper breakfast for once. Hoping to keep this momentum going into the
+new year — setting a goal to run 3× a week and journal more consistently.
+
+---
+
+## 2026-01-03 21:00  #workout
+
+Long run today: 12 km in 58 minutes. Felt strong after the first 3 km. Left knee
+was a bit tight at the end — probably need to stretch more. Will book a physio
+appointment if it keeps up.
+
+---
+
+## 2026-01-05 20:30  #career #lifestyle
+
+Tough day at work. The sprint review didn't go well — we missed two tickets and
+the stakeholder was visibly annoyed. Had a good debrief with the team though and
+we've already updated the next sprint plan. Feeling okay about it, just tired.
+
+---

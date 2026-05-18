@@ -1,15 +1,13 @@
 """Two-pass agent router.
 
 Pass 1 — Router LLM call:
-    Classifies the user message into {type, agent, category} using router.md prompt.
+    Classifies the user message into {type, agent, category, summary} using router.md.
+    For notes, summary is a one-liner stored in the notes table.
+    No separate classifier call needed — router handles both routing and summarisation.
 
 Pass 2 — Agent LLM call (or direct reply for general):
     Builds context from per-agent history + relevant notes, injects persona prompt,
     runs the main tool-calling loop.
-
-Note intake side-effect:
-    When type == "note", the router first classifies it with classifier.md,
-    stores it in the notes table, then hands off to the relevant agent for a response.
 """
 from __future__ import annotations
 
@@ -24,7 +22,7 @@ from openai import OpenAI, OpenAIError
 
 from ..config import (
     DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL,
-    DEBUG_LOG_ROUTER, DEBUG_LOG_CLASSIFIER,
+    DEBUG_LOG_ROUTER,
 )
 from .. import audit, db, debug_log
 from ..db import _utc_now
@@ -37,22 +35,44 @@ PROMPTS_DIR = Path(__file__).parent.parent.parent / "data" / "prompts"
 def _parse_json(raw: str) -> dict:
     """Extract and parse the first valid JSON object from a model response.
 
-    DeepSeek sometimes wraps its JSON in markdown code fences (```json … ```).
-    We scan all fence segments first, then fall back to the raw string.
+    Handles three common failure modes from DeepSeek:
+      1. Markdown code fences  — ```json { … } ```
+      2. Preamble / postamble  — "Sure! Here is the JSON: { … }"
+      3. Truncated response    — {"type": "conver   (cut off by max_tokens)
+
+    Strategy: try the most-specific extraction first, fall back progressively.
+    Truncated JSON will still raise JSONDecodeError after all attempts — the
+    caller (_llm_json) will retry the whole API call in that case.
     """
-    # Strip code fences like ```json ... ```
+    candidates: list[str] = []
+
+    # 1. Content inside ```...``` fences (most explicit signal from the model)
     if "```" in raw:
         parts = raw.split("```")
         for part in parts:
             s = part.strip()
             if s.startswith("json"):
                 s = s[4:].strip()
-            try:
-                return json.loads(s)
-            except json.JSONDecodeError:
-                continue
-    # Try the raw string directly
-    return json.loads(raw)
+            if s.startswith("{"):
+                candidates.append(s)
+
+    # 2. Raw string (model obeyed the "no markdown" instruction)
+    candidates.append(raw.strip())
+
+    # 3. First {...} span — handles preamble/postamble text around the JSON
+    start = raw.find("{")
+    end   = raw.rfind("}") + 1
+    if start >= 0 and end > start:
+        candidates.append(raw[start:end])
+
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+
+    # All candidates failed — raise so the caller can decide whether to retry
+    raise json.JSONDecodeError("No valid JSON object found in response", raw, 0)
 
 _client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 
@@ -62,9 +82,17 @@ _client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 # ---------------------------------------------------------------------------
 
 def _load_prompt(name: str) -> str:
-    """Read data/prompts/<name>.md and return its text, or '' if the file is missing."""
+    """Read data/prompts/<name>.md and return its text, or '' if the file is missing.
+
+    For the router prompt, replaces the {{AGENTS}} placeholder with the
+    dynamically discovered agent list so new agents are picked up automatically.
+    """
     p = PROMPTS_DIR / f"{name}.md"
-    return p.read_text() if p.exists() else ""
+    text = p.read_text(encoding="utf-8") if p.exists() else ""
+    if name == "router" and "{{AGENTS}}" in text:
+        from .discovery import build_agents_block
+        text = text.replace("{{AGENTS}}", build_agents_block())
+    return text
 
 
 
@@ -78,21 +106,27 @@ def _load_prompt(name: str) -> str:
 # and only needs a tiny output (max_tokens=200). Making these configurable
 # would invite accidentally breaking the routing logic.
 _ROUTER_TEMPERATURE = 0.0   # must stay 0 — random routing would be catastrophic
-_ROUTER_MAX_TOKENS  = 200   # a JSON object like {"type":"note","agent":"workout",...} fits in ~50 tokens
-_ROUTER_RETRIES     = 2     # DeepSeek occasionally returns empty on first attempt under load
+_ROUTER_MAX_TOKENS  = 500   # pure JSON fits in ~50 tokens, but models sometimes add preamble/thinking
+                             # before the { — 500 gives enough room without wasting quota
+_ROUTER_RETRIES     = 2     # DeepSeek occasionally returns empty or truncated on first attempt
 
 
 def _llm_json(
     system: str, user: str, retries: int = _ROUTER_RETRIES
 ) -> tuple[dict, str, dict | None, int]:
-    """Call the LLM expecting JSON output; retries on empty response.
+    """Call the LLM expecting JSON output; retries on empty or unparseable responses.
 
     Uses deterministic settings (_ROUTER_TEMPERATURE=0.0) so routing
     decisions are consistent across identical inputs.
 
     Returns (parsed_result, raw_text, usage_dict_or_None, attempt_count).
     Callers unpack only what they need; the extra fields are used by debug
-    logging in route() and classify_note().
+    logging in route().
+
+    Retries on:
+      - empty response (model returned nothing)
+      - JSONDecodeError (model returned text that couldn't be parsed, e.g. truncated JSON)
+    Does NOT retry on OpenAIError — those are API-level failures the caller handles.
     """
     last_raw = ""
     last_usage: dict | None = None
@@ -112,14 +146,21 @@ def _llm_json(
             {"prompt": u.prompt_tokens, "completion": u.completion_tokens, "total": u.total_tokens}
             if u else None
         )
-        if last_raw:
+        if not last_raw:
+            log.warning("Router: empty response on attempt %d/%d, retrying", attempt + 1, retries + 1)
+            continue
+        try:
             return _parse_json(last_raw), last_raw, last_usage, attempt + 1
-        log.warning("Router: empty response on attempt %d/%d, retrying", attempt + 1, retries + 1)
-    raise ValueError("Empty response after retries")
+        except json.JSONDecodeError as e:
+            log.warning(
+                "Router: JSON parse failed on attempt %d/%d (%s), retrying — raw: %.120r",
+                attempt + 1, retries + 1, e, last_raw,
+            )
+    raise ValueError(f"Router gave no valid JSON after {retries + 1} attempts. Last raw: {last_raw!r:.200}")
 
 
 def route(user_message: str, recent_context: str = "") -> dict[str, str]:
-    """Classify a user message. Returns {type, agent, category}.
+    """Classify a user message. Returns {type, agent, category, summary}.
 
     `recent_context` is an optional hint (e.g. "The previous conversation was
     with the workout agent.") appended to the user message so the router can
@@ -138,7 +179,7 @@ def route(user_message: str, recent_context: str = "") -> dict[str, str]:
         result, raw, usage, attempts = _llm_json(router_system, prompt_text)
     except (OpenAIError, json.JSONDecodeError, KeyError, ValueError) as e:
         log.warning("Router failed (%s: %s), defaulting to general/none", type(e).__name__, e)
-        result = {"type": "conversation", "agent": "none", "category": "none"}
+        result = {"type": "chat", "agent": "none", "category": "none"}
 
     # Always: log the routing decision (summary) to the audit log.
     audit.log_event(
@@ -164,38 +205,6 @@ def route(user_message: str, recent_context: str = "") -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Note classification
-# ---------------------------------------------------------------------------
-
-def classify_note(text: str) -> dict[str, str]:
-    """Run the note classifier. Returns {category, summary}."""
-    classifier_system = _load_prompt("classifier")
-    raw = ""
-    usage: dict | None = None
-    attempts = 0
-    try:
-        result, raw, usage, attempts = _llm_json(classifier_system, text)
-    except (OpenAIError, json.JSONDecodeError, ValueError) as e:
-        log.warning("Classifier failed (%s: %s), defaulting to uncategorized", type(e).__name__, e)
-        result = {"category": "uncategorized", "summary": text[:80]}
-
-    audit.log_event("note_classified", input_preview=text[:200], result=result)
-
-    if DEBUG_LOG_CLASSIFIER:
-        debug_log.log(
-            "debug_classifier_call",
-            system_prompt=classifier_system,
-            user_input=text,
-            raw_response=raw,
-            parsed_result=result,
-            usage=usage,
-            attempts=attempts,
-        )
-
-    return result
-
-
-# ---------------------------------------------------------------------------
 # Context assembly for agents
 # ---------------------------------------------------------------------------
 
@@ -209,6 +218,14 @@ def _build_agent_context(agent: str, category: str) -> str:
     parts: list[str] = [
         f"## Today's date\n{today}",
         (
+            "## Tool honesty rule — CRITICAL\n"
+            "Your text responses NEVER change any data. Only tool calls do.\n"
+            "NEVER say something was saved, added, updated, or logged unless you actually "
+            "called the relevant tool in this same response and it returned ok.\n"
+            "If you want to add a todo → call todo_add. "
+            "If you want to save a note → call note_add. "
+            "If you want to write a file → call file_write or file_append. "
+            "Saying 'Done!' without calling the tool is a lie — do not do it.\n\n"
             "## Tool use rules\n"
             "Destructive tools (calendar_create_event, gmail_send_message, etc.) stage "
             "the action — nothing executes until the user confirms. "
@@ -228,8 +245,9 @@ def _build_agent_context(agent: str, category: str) -> str:
     # If that maps to a valid notes category we use it directly; otherwise we
     # fall back to the agent name itself (e.g. "workout") so we still get the
     # most relevant notes even when the category is vague or unrecognised.
+    from .discovery import get_agents
     note_category = category if category not in ("none", "uncategorized") else agent
-    if note_category in ("workout", "lifestyle", "career"):
+    if note_category in get_agents():
         with db._connect() as conn:
             rows = conn.execute(
                 "SELECT ts, summary, raw_text FROM notes "
@@ -242,18 +260,24 @@ def _build_agent_context(agent: str, category: str) -> str:
             )
             parts.append(f"## Recent {note_category} notes\n{note_lines}")
 
-    # Agent conversation memory
-    with db._connect() as conn:
-        turns = conn.execute(
-            "SELECT role, content FROM agent_conversations "
-            "WHERE agent = ? ORDER BY ts DESC LIMIT 20",
-            (agent,),
-        ).fetchall()
-    if turns:
-        history_lines = "\n".join(
-            f"{r[0].upper()}: {r[1][:200]}" for r in reversed(turns)
-        )
-        parts.append(f"## Recent conversation history with {agent} agent\n{history_lines}")
+    # Auto-inject personal profile — always available so agents never start cold.
+    # Silently skipped if the file doesn't exist (first-time setup / new user).
+    data_dir = PROMPTS_DIR.parent
+    profile_path = data_dir / "personal_profile.md"
+    if profile_path.exists():
+        parts.append(f"## Personal profile\n{profile_path.read_text(encoding='utf-8').strip()}")
+
+    # Auto-inject agent-specific goals file (data/goals/<agent>.md) if it exists.
+    # Each agent only sees its own domain goals — no cross-domain noise.
+    goals_path = data_dir / "goals" / f"{agent}.md"
+    if goals_path.exists():
+        parts.append(f"## {agent.capitalize()} goals\n{goals_path.read_text(encoding='utf-8').strip()}")
+
+    # NOTE: conversation history is NOT injected here as a text block.
+    # dispatch.py passes the actual agent_conversations rows as properly-formatted
+    # OpenAI messages (role/content pairs) in the messages array sent to the LLM.
+    # Injecting a truncated text digest here as well would duplicate the same data,
+    # waste tokens on every call, and risk confusing the model with two versions.
 
     return "\n\n".join(parts)
 

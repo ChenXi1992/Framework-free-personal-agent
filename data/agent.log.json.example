@@ -22,7 +22,7 @@
   "ts": "2026-01-01T09:00:00.050+00:00",
   "event": "route_decision",
   "input_preview": "How was my sleep this week?",
-  "result": { "type": "conversation", "agent": "workout", "category": "sleep" },
+  "result": { "type": "chat", "agent": "workout", "category": "workout", "summary": null },
   "had_context_hint": false
 }
 
@@ -30,7 +30,7 @@
   "ts": "2026-01-01T09:00:00.060+00:00",
   "event": "dispatch",
   "user_id": 123456789,
-  "type": "conversation",
+  "type": "chat",
   "agent": "workout",
   "category": "sleep",
   "sticky_fallback": false,

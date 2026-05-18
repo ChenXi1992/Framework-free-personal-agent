@@ -1,0 +1,14 @@
+# Todo
+# This file shows the format used by data/todo.md.
+# All content below is fictional — no real data.
+# The real todo.md is gitignored and never committed.
+#
+# Items are added automatically via the todo_add tool, or you can edit manually.
+# Open items:   - [ ] Task description
+# Done items:   - [x] Task description  *(done YYYY-MM-DD)*
+
+- [ ] Book physio appointment for left knee
+- [ ] Research half-marathon training plans
+- [ ] Reply to recruiter email from Tuesday
+- [x] Set up weekly review reminder in calendar  *(done 2026-01-02)*
+- [x] Order running shoes  *(done 2025-12-28)*

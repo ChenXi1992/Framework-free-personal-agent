@@ -1,12 +1,18 @@
 """LLM-callable tools for notes, agent conversations, and feedback."""
 from __future__ import annotations
 
-import sqlite3
 import time
 from typing import Any
 
+from ..agents.discovery import get_agents
 from ..db import _connect, _utc_now
 from .registry import tool
+
+# Build dynamic enum lists once at module load (per-process, matches discovered agents).
+_AGENTS        = list(get_agents())
+_CATEGORIES    = _AGENTS + ["uncategorized"]
+_CATEGORIES_EX = _AGENTS + ["uncategorized", "all"]   # includes 'all' for filter tools
+_AGENTS_EX     = _AGENTS + ["all"]                    # includes 'all' for feedback_recent
 
 
 # ---------------------------------------------------------------------------
@@ -15,14 +21,14 @@ from .registry import tool
 
 @tool(
     description=(
-        "Store a classified note. Call this after the classifier has determined "
-        "the category and summary. Returns the new note id."
+        "Store a note with a category and summary. Returns the new note id."
     ),
     parameters={
         "type": "object",
         "properties": {
             "text":     {"type": "string", "description": "The original raw text of the note."},
-            "category": {"type": "string", "enum": ["workout", "lifestyle", "career", "uncategorized"]},
+            "category": {"type": "string", "enum": _CATEGORIES,
+                         "description": "Agent domain this note belongs to, or 'uncategorized'."},
             "summary":  {"type": "string", "description": "One-sentence summary, max 20 words."},
         },
         "required": ["text", "category", "summary"],
@@ -48,7 +54,7 @@ def note_add(text: str, category: str, summary: str) -> dict[str, Any]:
         "properties": {
             "category": {
                 "type": "string",
-                "enum": ["workout", "lifestyle", "career", "uncategorized", "all"],
+                "enum": _CATEGORIES_EX,
                 "description": "Filter by category, or 'all' for every category.",
             },
             "limit": {"type": "integer", "description": "Max notes to return (default 10, max 50)."},
@@ -91,7 +97,8 @@ def notes_recent(category: str = "all", limit: int = 10) -> dict[str, Any]:
             "query":    {"type": "string", "description": "Keywords to search for."},
             "category": {
                 "type": "string",
-                "enum": ["workout", "lifestyle", "career", "uncategorized", "all"],
+                "enum": _CATEGORIES_EX,
+                "description": "Filter by category, or 'all' to search everything.",
             },
             "limit": {"type": "integer", "description": "Max results (default 10)."},
         },
@@ -134,15 +141,11 @@ def notes_search(query: str, category: str = "all", limit: int = 10) -> dict[str
         "Log one turn of an agent conversation for memory. "
         "Call after every user message and agent reply."
     ),
-    # NOTE: dispatch.py calls router.store_turn() directly after every agent
-    # response, so the agent loop itself handles normal conversation logging.
-    # This tool exists for cases where the LLM explicitly wants to save a
-    # summary or important moment mid-conversation, separate from the automatic
-    # per-turn logging that happens in the background.
     parameters={
         "type": "object",
         "properties": {
-            "agent":   {"type": "string", "enum": ["workout", "lifestyle", "career"]},
+            "agent":   {"type": "string", "enum": _AGENTS,
+                        "description": "The agent this conversation belongs to."},
             "role":    {"type": "string", "enum": ["user", "assistant"]},
             "content": {"type": "string"},
         },
@@ -167,7 +170,8 @@ def conversation_add(agent: str, role: str, content: str) -> dict[str, Any]:
     parameters={
         "type": "object",
         "properties": {
-            "agent": {"type": "string", "enum": ["workout", "lifestyle", "career"]},
+            "agent": {"type": "string", "enum": _AGENTS,
+                      "description": "The agent whose history to retrieve."},
             "limit": {"type": "integer", "description": "Max turns to return (default 20)."},
         },
         "required": ["agent"],
@@ -199,7 +203,8 @@ def conversation_recent(agent: str, limit: int = 20) -> dict[str, Any]:
     parameters={
         "type": "object",
         "properties": {
-            "agent":     {"type": "string", "enum": ["workout", "lifestyle", "career"]},
+            "agent":     {"type": "string", "enum": _AGENTS,
+                          "description": "The agent this feedback is about."},
             "sentiment": {"type": "string", "enum": ["positive", "negative", "neutral"]},
             "note":      {"type": "string", "description": "What happened — quote the user or describe the signal."},
         },
@@ -221,7 +226,8 @@ def feedback_add(agent: str, sentiment: str, note: str) -> dict[str, Any]:
     parameters={
         "type": "object",
         "properties": {
-            "agent": {"type": "string", "enum": ["workout", "lifestyle", "career", "all"]},
+            "agent": {"type": "string", "enum": _AGENTS_EX,
+                      "description": "Agent name, or 'all' for every agent."},
             "limit": {"type": "integer", "description": "Max entries (default 20)."},
         },
         "required": ["agent"],

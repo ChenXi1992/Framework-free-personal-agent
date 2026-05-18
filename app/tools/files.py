@@ -131,7 +131,11 @@ def file_list(*, path: str = ".") -> str:
     description=(
         "Write (overwrite or create) a local plain-text file. "
         f"All paths are relative to FILES_ROOT ({FILES_ROOT}). "
-        "STAGED — does not execute until the user types 'confirm'. "
+        "CALL THIS TOOL IMMEDIATELY when the user asks for a write — do NOT wait "
+        "for 'confirm' before calling. Calling this tool stages the action; the "
+        "actual write only happens after the user types 'confirm'. "
+        "Use this to replace the entire content of a file. "
+        "To add a section to an existing file use file_append instead. "
         "Allowed extensions: .md .txt .rst .csv .json .yaml .yml .toml .ini "
         ".cfg .log .html .xml."
     ),
@@ -152,13 +156,13 @@ def file_list(*, path: str = ".") -> str:
     },
     destructive=True,
 )
-def file_write(*, path: str, content: str, user_id: int) -> str:
+def file_write(*, path: str, content: str, user_id: int) -> dict[str, Any]:
     target = _safe_path(path)
     _check_extension(target)
     preview = (
         f"Write file: {path}\n"
         f"  Size: {len(content)} characters\n"
-        f"  Preview: {content[:120]!r}{'…' if len(content) > 120 else ''}"
+        f"  Preview: {content[:200]!r}{'…' if len(content) > 200 else ''}"
     )
     action_id = stage_action(
         user_id=user_id,
@@ -166,14 +170,18 @@ def file_write(*, path: str, content: str, user_id: int) -> str:
         arguments={"path": path, "content": content},
         preview=preview,
     )
-    return f"staged {action_id}"
+    return {"staged": True, "action_id": action_id, "preview": preview}
 
 
 @tool(
     description=(
         "Replace an exact string in an existing local file. "
         f"All paths are relative to FILES_ROOT ({FILES_ROOT}). "
-        "STAGED — does not execute until the user types 'confirm'. "
+        "CALL THIS TOOL IMMEDIATELY — calling it stages the action; the actual "
+        "write only happens after the user types 'confirm'. "
+        "Use this to UPDATE an existing section (not to add new content). "
+        "Always call file_read first to get the exact current text, then pass "
+        "the exact section heading + content as old_text. "
         "`old_text` must appear exactly once in the file. "
         "Allowed extensions: .md .txt .rst .csv .json .yaml .yml .toml .ini "
         ".cfg .log .html .xml."
@@ -199,7 +207,7 @@ def file_write(*, path: str, content: str, user_id: int) -> str:
     },
     destructive=True,
 )
-def file_edit(*, path: str, old_text: str, new_text: str, user_id: int) -> str:
+def file_edit(*, path: str, old_text: str, new_text: str, user_id: int) -> dict[str, Any]:
     target = _safe_path(path)
     _check_extension(target)
     if not target.exists():
@@ -224,14 +232,19 @@ def file_edit(*, path: str, old_text: str, new_text: str, user_id: int) -> str:
         arguments={"path": path, "old_text": old_text, "new_text": new_text},
         preview=preview,
     )
-    return f"staged {action_id}"
+    return {"staged": True, "action_id": action_id, "preview": preview}
 
 
 @tool(
     description=(
         "Append text to the end of an existing local file. "
         f"All paths are relative to FILES_ROOT ({FILES_ROOT}). "
-        "STAGED — does not execute until the user types 'confirm'. "
+        "CALL THIS TOOL IMMEDIATELY — calling it stages the action; the actual "
+        "write only happens after the user types 'confirm'. "
+        "Use this ONLY to add genuinely NEW sections. "
+        "IMPORTANT: call file_read first to check the file contents. "
+        "If a section with the same ## heading already exists, use file_edit to "
+        "UPDATE it instead — never append a section that already exists. "
         "Allowed extensions: .md .txt .rst .csv .json .yaml .yml .toml .ini "
         ".cfg .log .html .xml."
     ),
@@ -252,14 +265,14 @@ def file_edit(*, path: str, old_text: str, new_text: str, user_id: int) -> str:
     },
     destructive=True,
 )
-def file_append(*, path: str, text: str, user_id: int) -> str:
+def file_append(*, path: str, text: str, user_id: int) -> dict[str, Any]:
     target = _safe_path(path)
     _check_extension(target)
     if not target.exists():
         raise FileNotFoundError(f"File not found: {path}")
     preview = (
         f"Append to file: {path}\n"
-        f"  Text: {text[:120]!r}{'…' if len(text) > 120 else ''}"
+        f"  Text: {text[:200]!r}{'…' if len(text) > 200 else ''}"
     )
     action_id = stage_action(
         user_id=user_id,
@@ -267,7 +280,7 @@ def file_append(*, path: str, text: str, user_id: int) -> str:
         arguments={"path": path, "text": text},
         preview=preview,
     )
-    return f"staged {action_id}"
+    return {"staged": True, "action_id": action_id, "preview": preview}
 
 
 # ---------------------------------------------------------------------------

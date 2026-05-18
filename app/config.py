@@ -44,7 +44,7 @@ DB_PATH: str = os.environ.get("DB_PATH", "me.db")
 LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 # Model: deepseek-chat (V3, fast/cheap) or deepseek-reasoner (R1, slower/smarter).
-DEEPSEEK_MODEL: str = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
+DEEPSEEK_MODEL: str = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro")
 
 # Base URL for the LLM API. DeepSeek is OpenAI-compatible, so changing this
 # to "https://api.openai.com/v1" (+ swapping the API key) switches providers.
@@ -57,7 +57,7 @@ DEEPSEEK_BASE_URL: str = os.environ.get(
 # 0.0 = fully deterministic, 1.0 = most varied. 0.9 is a good default for a
 # personal assistant — creative enough to feel natural, not so random it hallucinates.
 # Lower this (e.g. 0.5) if you want more focused, conservative answers.
-AGENT_TEMPERATURE: float = float(os.environ.get("AGENT_TEMPERATURE", "0.3"))
+AGENT_TEMPERATURE: float = float(os.environ.get("AGENT_TEMPERATURE", "0.8"))
 
 # Maximum number of tool-call iterations per user message. Each iteration is
 # one LLM call + its tool calls. Most questions resolve in 1–3 turns; the cap
@@ -67,6 +67,10 @@ MAX_TOOL_TURNS: int = int(os.environ.get("MAX_TOOL_TURNS", "10"))
 # How many turns of prior conversation to include in each LLM call.
 HISTORY_TURNS: int = int(os.environ.get("HISTORY_TURNS", "20"))
 
+# Default agent for diary entries when the router returns agent=none.
+# Override if you've replaced or renamed the growth agent.
+DIARY_DEFAULT_AGENT: str = os.environ.get("DIARY_DEFAULT_AGENT", "growth")
+
 # --- Per-component debug logging -------------------------------------------
 # Edit these directly when debugging. All are no-ops unless LOG_LEVEL=DEBUG.
 # When active, a separate data/debug.log.json is written with full-fidelity
@@ -75,9 +79,8 @@ HISTORY_TURNS: int = int(os.environ.get("HISTORY_TURNS", "20"))
 _IS_DEBUG = LOG_LEVEL == "DEBUG"
 
 DEBUG_LOG_ROUTER:        bool = _IS_DEBUG and True   # router.md prompt + raw response + token usage
-DEBUG_LOG_CLASSIFIER:    bool = _IS_DEBUG and False  # classifier.md prompt + raw response (notes only)
-DEBUG_LOG_AGENT_PROMPT:  bool = _IS_DEBUG and False  # full system prompt (persona.md + context block) — can be large
+DEBUG_LOG_AGENT_PROMPT:  bool = _IS_DEBUG and True  # full system prompt (persona.md + context block) — can be large
 DEBUG_LOG_LLM_RESPONSE:  bool = _IS_DEBUG and True   # complete reply text every turn (no 500-char cap)
-DEBUG_LOG_REASONING:     bool = _IS_DEBUG and False  # DeepSeek reasoning_content / thinking tokens — can be very long
+DEBUG_LOG_REASONING:     bool = _IS_DEBUG and True  # DeepSeek reasoning_content / thinking tokens — can be very long
 DEBUG_LOG_FINISH_REASON: bool = _IS_DEBUG and True   # stop / tool_calls / length per turn
-DEBUG_LOG_MESSAGES:      bool = _IS_DEBUG and False  # full messages[] sent to API (⚠ can be large)
+DEBUG_LOG_MESSAGES:      bool = _IS_DEBUG and True  # full messages[] sent to API (⚠ can be large)
