@@ -7,8 +7,8 @@ Every table stores two timestamp representations:
   ts         INTEGER  — Unix epoch seconds (fast to sort/index, compact)
   created_at TEXT     — 'YYYY-MM-DD HH:MM:SS' UTC (human-readable in DB Browser)
 
-Health tables sourced from Huawei data use the same pattern:
-  date       TEXT     — 'YYYYMMDD' (original Huawei format, used as primary key)
+Health tables use the same pattern:
+  date       TEXT     — 'YYYYMMDD' (compact date format, used as primary key)
   date_iso   TEXT     — 'YYYY-MM-DD' (readable equivalent of date)
   datetime_utc TEXT   — 'YYYY-MM-DD HH:MM:SS' UTC (for heart_rate / sport_minute)
 """
@@ -66,9 +66,9 @@ CREATE TABLE IF NOT EXISTS feedback (
     note        TEXT    NOT NULL
 );
 
--- Huawei Health: daily summary (steps, distance, calories, HR, sleep)
+-- Health: daily summary (steps, distance, calories, HR, sleep)
 CREATE TABLE IF NOT EXISTS health_daily (
-    date            TEXT PRIMARY KEY,  -- YYYYMMDD (Huawei native format)
+    date            TEXT PRIMARY KEY,  -- YYYYMMDD
     date_iso        TEXT,              -- YYYY-MM-DD (human-readable)
     steps           INTEGER,
     distance_m      INTEGER,
@@ -86,7 +86,7 @@ CREATE TABLE IF NOT EXISTS health_daily (
     sleep_awake_min INTEGER
 );
 
--- Huawei Health: daily totals broken down by sport type
+-- Health: daily totals broken down by sport type
 CREATE TABLE IF NOT EXISTS sport_daily (
     date          TEXT NOT NULL,   -- YYYYMMDD
     date_iso      TEXT,            -- YYYY-MM-DD
@@ -99,7 +99,7 @@ CREATE TABLE IF NOT EXISTS sport_daily (
     PRIMARY KEY (date, sport_type)
 );
 
--- Huawei Health: heart rate time series (one row per reading)
+-- Health: heart rate time series (one row per reading)
 CREATE TABLE IF NOT EXISTS heart_rate (
     ts           INTEGER PRIMARY KEY,  -- unix seconds
     date         TEXT NOT NULL,        -- YYYYMMDD for fast date queries
@@ -109,7 +109,7 @@ CREATE TABLE IF NOT EXISTS heart_rate (
 );
 CREATE INDEX IF NOT EXISTS idx_hr_date ON heart_rate(date);
 
--- Huawei Health: per-minute activity breakdown
+-- Health: per-minute activity breakdown
 CREATE TABLE IF NOT EXISTS sport_minute (
     ts            INTEGER PRIMARY KEY,  -- unix seconds (start of minute)
     date          TEXT NOT NULL,        -- YYYYMMDD
@@ -194,6 +194,14 @@ def _migrate_notes_categories(conn: sqlite3.Connection) -> None:
         notes_row = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='notes'"
         ).fetchone()
+        old_row = None  # consumed — no longer present
+
+    # Both tables exist: _notes_old is leftover garbage from a previous crashed
+    # migration that got partway through (renamed notes but crashed before DROP).
+    # The notes table is already the new schema — just drop the stale backup.
+    if old_row and notes_row:
+        conn.execute("DROP TABLE _notes_old")
+        old_row = None
 
     # If the CHECK constraint is gone already, nothing to do.
     if notes_row and "CHECK" not in notes_row[0]:

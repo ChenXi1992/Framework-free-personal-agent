@@ -173,7 +173,7 @@ Agents are discovered automatically from `data/prompts/` — any `.md` file that
 
 | Agent | Persona file | Scope |
 |---|---|---|
-| `workout` | `workout.md` | Physical training, running, sport, body, recovery. Access to Huawei Health data and Google Calendar |
+| `workout` | `workout.md` | Physical training, running, sport, body, recovery. Access to health data and Google Calendar |
 | `lifestyle` | `lifestyle.md` | Observable daily behaviours: diet, sleep schedule, screen time, gaming, routines. **Not** feelings — those go to growth |
 | `growth` | `growth.md` | Emotions, mood, self-reflection, personal development, relationships, psychology, mindset. Default handler for diary entries (configurable via `DIARY_DEFAULT_AGENT`) |
 | `career` | `career.md` | Work, meetings, professional development, job performance, career goals |
@@ -231,7 +231,7 @@ Each integration follows the same pattern:
 | `app/tools/notes.py` | `note_add`, `notes_recent`, `notes_search`, `conversation_add`, `feedback_add`, `feedback_recent` |
 | `app/tools/todo.py` | `todo_add`, `todo_list`, `todo_done`, `todo_delete`. Backed by `data/todo.md` |
 | `app/tools/diary.py` | `diary_add` (appends dated entry to `data/diary.md`), `diary_recent` (reads back by category) |
-| `app/tools/health.py` | `health_daily_summary`, `health_sport_breakdown`, `health_heart_rate`, `health_workout_sessions` (queries Huawei Health data in SQLite) |
+| `app/tools/health.py` | `health_daily_summary`, `health_sport_breakdown`, `health_heart_rate`, `health_workout_sessions` (queries health data in SQLite) |
 | `app/tools/prompts.py` | `prompt_read`, `prompt_propose` (staged), `tool_need` (logs feature requests to `data/tool_needs.md`) |
 
 ---
@@ -248,7 +248,7 @@ All SQLite. WAL mode + autocommit so concurrent reads/writes don't block.
 | `agent_conversations` | Per-agent conversation memory (separate from global `messages`). Filtered by `agent` column. Specialist agents receive this as properly-formatted OpenAI messages — not as a text digest in the system prompt |
 | `feedback` | Agent feedback entries (positive / negative / neutral) |
 | `pending_actions` | Staged destructive actions waiting for user confirmation |
-| `health_daily` | Daily Huawei Health summary (steps, calories, HR, sleep) |
+| `health_daily` | Daily health summary (steps, calories, HR, sleep) |
 | `sport_daily` | Daily breakdown by sport type |
 | `heart_rate` | Time-series heart rate readings |
 | `sport_minute` | Per-minute activity breakdown |

@@ -25,7 +25,7 @@ Next:
 - **Read your stuff.** Search Gmail, read Notion pages, list calendar events, read local text files.
 - **Write your stuff.** Append to Notion, compose drafts, create calendar events, edit files — gated behind a two-step confirmation flow for anything destructive.
 - **Specialist agents.** Drop a `.md` file into `data/prompts/` and the agent is live on next restart — no code changes. Five built-in agents:
-  - **workout** — training coach with access to Huawei Health history and Google Calendar
+  - **workout** — training coach with access to Google Calendar and health data
   - **lifestyle** — tracks observable behaviours: diet, sleep schedule, screen time, gaming
   - **growth** — inner-life coach for emotions, self-reflection, personal development
   - **career** — professional development, meeting notes, career goals
@@ -89,7 +89,7 @@ Tool integrations (all optional, import-guarded):
   diary.py       — diary_add, diary_recent
   context.py     — context_list, context_load (on-demand file loading)
   prompts.py     — read/propose agent prompt files (staged), log tool needs
-  health.py      — query Huawei Health data (steps, HR, sleep, workouts)
+  health.py      — query health data (steps, HR, sleep, workouts)
 ```
 
 ---
@@ -158,13 +158,13 @@ The agent can read, list, and write plain-text files. `FILES_ROOT` defaults to `
 
 Write/edit/append are staged — the user must confirm before bytes hit disk. Staged tools return a `{"staged": True, "action_id": …, "preview": …}` dict so the footer always appears.
 
-### Huawei Health data
+### Health data
 
 Import your exported health data into SQLite once:
 
 ```bash
-# Place your Huawei Health export in HUAWEI_HEALTH_DATA/
-python scripts/process_health_data.py --data-dir HUAWEI_HEALTH_DATA --db data/me.db
+# Place your health data export in HEALTH_DATA/
+python scripts/process_health_data.py --data-dir HEALTH_DATA --db data/me.db
 ```
 
 The workout agent then has access to:
@@ -338,7 +338,7 @@ me-agent/
 │       ├── career.md
 │       └── dutch.md
 ├── scripts/
-│   └── process_health_data.py       ← one-time Huawei Health import
+│   └── process_health_data.py       ← one-time health data import
 └── app/
     ├── __init__.py
     ├── config.py                    ← env-var loading + validation
@@ -361,7 +361,7 @@ me-agent/
         ├── todo.py                 ← todo list (backed by data/todo.md)
         ├── diary.py                ← diary entries (backed by data/diary.md)
         ├── prompts.py              ← read/propose agent prompt files
-        ├── health.py               ← Huawei Health query tools
+        ├── health.py               ← health data query tools
         ├── notion.py               ← Notion MCP tools
         ├── notion_auth.py          ← one-time OAuth setup for Notion MCP
         ├── notion_cookie_auth.py   ← legacy cookie-based setup (superseded)
@@ -384,5 +384,5 @@ me-agent/
 - **Hallucination guard needs a regex, not keywords.** A keyword list fires on `"I've noted your baseline"` or `"well done"`. A regex matching `I've saved`, `I added`, `I logged` only fires on explicit first-person write claims.
 - **DeepSeek thinking models return `reasoning_content`** which the API requires you to echo back on turn 2+, or you get HTTP 400. Using `msg.model_dump(exclude_none=True)` preserves all extra fields automatically.
 - **Notion MCP tokens expire hourly.** The `refresh_access_token()` function in `notion_auth.py` refreshes on 401 automatically; no manual re-auth needed.
-- **Huawei Health data ends in Feb 2023.** The `health_workout_sessions` tool uses `MAX(date)` from the table as the reference point rather than `date('now')`, so queries like "last 30 days" work correctly against historical data.
+- **Health data may be historical.** The `health_workout_sessions` tool uses `MAX(date)` from the table as the reference point rather than `date('now')`, so queries like "last 30 days" work correctly against historical data.
 - **The LLM is not a reliable narrator.** The staged-action footer is the structural source of truth for "what is pending" — shown unconditionally below the LLM's reply text, built from tool return values, not from what the LLM said.

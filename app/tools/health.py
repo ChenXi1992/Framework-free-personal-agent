@@ -1,4 +1,4 @@
-"""LLM-callable query tools for Huawei Health data.
+"""LLM-callable query tools for health data.
 
 Tables populated by scripts/process_health_data.py:
     health_daily   — per-day summary (steps, HR, sleep, SpO2)
@@ -13,7 +13,7 @@ from typing import Any
 from ..db import _connect
 from .registry import tool
 
-# Huawei Health records one row per activity minute. A gap longer than this
+# Health data records one row per activity minute. A gap longer than this
 # between consecutive rows means the user stopped — start a new session.
 # 300 s (5 min) covers normal pauses (traffic lights, water break) without
 # splitting a single workout into fragments.
@@ -229,7 +229,7 @@ def health_workout_sessions(days: int = 30, sport_name: str = "", limit: int = 2
     # A new session starts when either:
     #   (a) the sport type changes — e.g. switching from running to walking, or
     #   (b) the gap between consecutive rows exceeds 300 seconds (5 minutes).
-    # 300s was chosen because Huawei Health records one row per activity minute;
+    # 300s was chosen because health data records one row per activity minute;
     # a gap longer than 5 minutes almost always means a rest/stop, not just
     # a missed reading. Shorter pauses (e.g. waiting at traffic lights) stay
     # within the same session.
@@ -256,7 +256,7 @@ def health_workout_sessions(days: int = 30, sport_name: str = "", limit: int = 2
             }
         else:
             cur["last_ts"]       = ts
-            # `dur` is occasionally NULL in the raw Huawei export for the first
+            # `dur` is occasionally NULL in the raw health export for the first
             # minute of a session. Fall back to 1 so the total isn't under-counted.
             cur["duration_min"] += dur or 1
             cur["distance_m"]   += dist or 0
