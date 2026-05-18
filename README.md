@@ -13,8 +13,8 @@ Currently:
 - Deepseek api only
 
 Next: 
-- Fine-tune the prompt ✔
-- Add diary category ✔
+- Fine-tune the prompt ✅
+- Add diary category ✅
 - Auto-summary & proactive agent
 - Deploy it by FastAPI ( Multi-access channel ) 
 
