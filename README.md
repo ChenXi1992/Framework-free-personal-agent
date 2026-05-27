@@ -1,23 +1,24 @@
 # Personal agent - A side project
 
-
 A personal Telegram-fronted AI assistant. Reads Gmail, Notion, Google Calendar, and local files. Routes messages to specialist agents (workout, lifestyle, growth, career, dutch) and remembers your history. Hand-rolled agent loop on top of DeepSeek's OpenAI-compatible API — no LangChain, no LlamaIndex, no framework.
 
-Designed to run on a local NAS or home server. 
+Designed to run on a local NAS or home server.
 
-The final goal is to build a personal assistant that store all the information about my daily life ( work, hobbies, lifestyle ), and ultimately makes decisions, provide feedback & automate certain tasks for me. 
+The final goal is to build a personal assistant that stores all the information about my daily life (work, hobbies, lifestyle), and ultimately makes decisions, provides feedback, and automates certain tasks for me.
 
-Currently: 
+**Currently:**
 - Access to Gmail, Calendar, Notion
-- Sub-agent: Career - auto reply email, workout coach, planning agent
-- Deepseek api only
+- Specialist agents: career, workout, lifestyle, growth, dutch
+- Long-term agent memory via rolling conversation summarisation
+- Diary, note intake, and todo list backed by plain Markdown files
+- Write confirmations always visible for note/diary/todo actions
+- Hallucination guard: warns when the LLM claims to save something but called no tool
+- Weekly summaries auto-generated per agent when a new week begins
 
-Next: 
-- Fine-tune the prompt ✅
-- Add diary category ✅
-- Auto-summary & proactive agent
-- Review the memory system 
-- Deploy it by FastAPI ( Multi-access channel ) 
+**Next:**
+- Deploy via FastAPI (multi-access channel)
+- Proactive reminders and scheduled agent check-ins
+- Fine-tune routing accuracy for edge cases
 
 ---
 
@@ -31,10 +32,13 @@ Next:
   - **growth** — inner-life coach for emotions, self-reflection, personal development
   - **career** — professional development, meeting notes, career goals
   - **dutch** — Dutch language teacher with pain-point tracking
+- **Long-term memory.** Each specialist agent maintains a rolling conversation summary. When total exchanges cross a threshold (default: 40 turns), older history is compressed into a persistent paragraph and injected back into every future system prompt. The agent never loses context about past goals, decisions, or commitments — even across many sessions.
 - **Note intake.** Anything logged as a note is categorised, stored, and automatically surfaced as context to the relevant agent on future calls.
 - **Diary.** Personal journal entries stored in `diary.md` and indexed in the notes table so agents can reference them.
 - **Todo list.** `todo_add`, `todo_done`, `todo_list` backed by `data/todo.md`.
+- **Write confirmations.** Every `note_add`, `diary_add`, and `todo_add` call shows a visible confirmation line in the reply — unconditionally, regardless of log level — so you always have ground-truth proof the data was saved.
 - **Goals files.** Goals are split by domain in `data/goals/` (`workout.md`, `growth.md`, `lifestyle.md`, `career.md`, `dutch.md`). Each specialist agent owns and updates its own file via staged file operations.
+- **Weekly summaries.** On the first message after a week boundary, the bot auto-generates a per-agent markdown summary of all notes logged that week and sends it to Telegram.
 - **Stays out of your way.** No inbound ports (long polling). No manual confirmation typing — `confirm` works, no slash, no action_id. Typos (`confirn`) and emoji (`confirm :)`) are handled.
 - **Audit trail.** JSON log of every user message, LLM call, tool invocation, and confirmation.
 - **Hallucination guard.** If the LLM claims to have saved something but called no write tool, a visible warning is appended to the reply.
@@ -51,34 +55,36 @@ Telegram (long polling — no inbound ports)
    - allow-list auth
    - /start /reset /confirm /cancel /tools
    - fuzzy "confirm" shortcut (handles typos, emoji, "yes")
+   - streams each LLM turn immediately via on_chunk callback
+   - write confirmation: always shows note/diary/todo tool calls
    - hallucination guard (regex check on reply vs tool calls)
-   - assembles reply (debug header + LLM text + staged-action footer)
+   - staged-action footer (unconditional — source of truth for pending actions)
          │
          ▼
-   app/agents/dispatch.py         ← Pass 1: classify + route
+   app/agents/dispatch.py         ← two-pass routing + persona builder
    - router.route(msg) → {type, agent, category}
    - types: note | diary | chat
    - agents: discovered dynamically from data/prompts/ on startup
-   - agents: workout | lifestyle | growth | career | dutch | none
    - note intake → db.notes (auto-stored + optional agent response)
    - diary intake → agent writes diary.md + note_add for context visibility
    - sticky fallback: short message + last agent within 1hr → inherit agent
-   - builds persona + context block for specialist agents
+   - summarise_if_needed() → generates/updates rolling conversation summary
+   - builds persona (persona.md + date + notes + profile + goals + summary)
          │
          ▼
-   app/llm.py                     ← Pass 2: tool-calling loop
+   app/llm.py                     ← tool-calling loop
    - DeepSeek client (OpenAI-compatible SDK)
    - up to MAX_TOOL_TURNS (default 10) tool turns per user message
    - preserves reasoning_content for DeepSeek thinking models
    - injects user_id into destructive tools server-side
          │
-    ┌────┴─────────────────────────────────────┐
-    ▼                ▼                         ▼
- app/tools/       app/tools/pending       app/audit.py
- registry.py      - SQLite staging         - JSON log
- - @tool decorator  queue                  - every event
- - hides user_id    - /confirm executes
-   from LLM schema  - /cancel discards
+    ┌────┴────────────────────────────────────────────┐
+    ▼                ▼                                ▼
+ app/tools/       app/tools/pending             app/audit.py
+ registry.py      - SQLite staging queue        - JSON audit log
+ - @tool decorator  - /confirm executes         - every event
+ - hides user_id    - /cancel discards
+   from LLM schema
 
 Tool integrations (all optional, import-guarded):
   notion.py      — search, read, append, create, archive (staged)
@@ -189,10 +195,22 @@ Every message is classified by a two-pass LLM call before it reaches the main ag
 **Pass 2 — Dispatch** (`app/agents/dispatch.py`):
 - `note` → router-generated summary stored to `notes` table, then optionally routes to agent for a response
 - `diary` → routed to agent (default: `growth`) with instructions to call `diary_add` + `note_add` + any action items
-- `agent != none` → persona prompt + today's date + tool rules + recent notes injected as system prompt; agent conversation history injected as messages
+- `agent != none` → persona prompt + today's date + tool rules + recent notes injected as system prompt; agent conversation history (last 20 turns) injected as messages
 - `agent == none` → general assistant with today's date + live tool list
 
 **Auto-injected context:** `personal_profile.md` and `goals/<agent>.md` are automatically included in every specialist agent's system prompt by `_build_agent_context()` — agents always know who Xi is and what their domain goals are without any tool call. Other `data/*.md` files are still loaded on demand via `context_list()` / `context_load()`.
+
+**Long-term memory (conversation summarisation):**
+Each agent's raw history is capped at the last 20 turns in the message window. To preserve older context, the system generates a rolling summary at every 20-turn boundary above the threshold (default: 40 total turns — configurable via `CONVERSATION_SUMMARY_THRESHOLD`):
+
+```
+Turn 40  → first summary: covers turns 1–40
+Turn 41–59 → summary(1–40) + raw(latest 20) in context
+Turn 60  → updated summary: previous summary + turns 41–60 merged
+...and so on every 20 turns
+```
+
+The summary is generated via a one-shot LLM call (temperature=0.0, second-person, plain text) and stored in the `conversation_summaries` table. It is injected into the system prompt as a `## Conversation history` section on every future call. When summarisation fires, a note appears in the reply: `📝 Summarised N turns into memory.`
 
 **Sticky-agent fallback:** short messages (≤ 5 words) with `agent=none` inherit the last specialist agent — but only if that conversation happened **within the last hour**. Prevents a morning workout session from dragging into an unrelated evening conversation.
 
@@ -240,9 +258,19 @@ The footer is the source of truth — it appears regardless of what the LLM said
 
 ---
 
+## Write confirmations
+
+`note_add`, `diary_add`, and `todo_add` always display a confirmation line in the reply, unconditionally — not gated on `LOG_LEVEL`. This makes hallucinations immediately visible: if the LLM says "I saved your note" but the `🔧 note_add(…) → ok` line does not appear, no data was actually written.
+
+```
+🔧 note_add(category="workout", summary="Ran 10km at 6:59/km") → ok (id=42) [61ms]
+```
+
+---
+
 ## Debugging
 
-**Debug mode** — set `LOG_LEVEL=DEBUG` in `.env`. Every reply gets a header:
+**Debug mode** — set `LOG_LEVEL=DEBUG` in `.env`. Every reply gets a full tool-call header:
 
 ```
 🔧 file_append(path="goals/career.md", text="## Career Goal…") → staged a3f8b2c1 [4ms]
@@ -251,6 +279,17 @@ The footer is the source of truth — it appears regardless of what the LLM said
 ———
 <staged-action footer>
 ```
+
+A separate `data/debug.log.json` is also written with full-fidelity, untruncated records. Individual components are controlled by flags in `config.py` (all default on when `LOG_LEVEL=DEBUG`):
+
+| Flag | What it captures |
+|---|---|
+| `DEBUG_LOG_ROUTER` | Full router prompt + raw LLM response + token usage |
+| `DEBUG_LOG_AGENT_PROMPT` | Complete system prompt sent to each agent (persona + context block) |
+| `DEBUG_LOG_LLM_RESPONSE` | Full response text every turn, untruncated |
+| `DEBUG_LOG_REASONING` | DeepSeek `reasoning_content` / thinking tokens |
+| `DEBUG_LOG_FINISH_REASON` | `stop` / `tool_calls` / `length` per turn |
+| `DEBUG_LOG_MESSAGES` | Full `messages[]` array sent to the API each turn *(can be large)* |
 
 **Audit log** — every event is appended to `data/agent.log.json`:
 
@@ -269,6 +308,9 @@ jq 'select(.event=="warning")' data/agent.WARNING.json
 
 # Total tokens used today
 jq -s '[.[] | select(.event=="llm_response") | .usage.total] | add' data/agent.log.json
+
+# View all conversation summaries
+jq 'select(.event=="dispatch" and .agent!="none")' data/agent.log.json
 ```
 
 Disable audit log by setting `AUDIT_LOG_PATH=` (empty) in `.env`.
@@ -294,19 +336,23 @@ AUDIT_LOG_PATH=./data/agent.log.json  # set to '' to disable
 
 # Behaviour
 LOG_LEVEL=INFO              # DEBUG adds per-tool header to every Telegram reply
-DEEPSEEK_MODEL=deepseek-v4-flash  # or deepseek-chat, deepseek-reasoner
+DEEPSEEK_MODEL=deepseek-v4-pro   # or deepseek-chat, deepseek-reasoner
 DEEPSEEK_BASE_URL=https://api.deepseek.com/v1  # swap to openai.com/v1 or a local Ollama endpoint
-HISTORY_TURNS=20
+HISTORY_TURNS=20            # raw turns included per agent call
 
 # LLM tuning
 AGENT_TEMPERATURE=0.8       # 0.0 = deterministic, 1.0 = most varied
 MAX_TOOL_TURNS=10           # max tool-call iterations per user message
 
+# Long-term memory
+CONVERSATION_SUMMARY_THRESHOLD=40  # total turns before first summary fires;
+                                    # updates every 20 turns thereafter.
+                                    # Set to 4 to test the feature quickly.
+
 # Optional
 FILES_ROOT=./data           # root for file tools (defaults to project data/ dir)
 DIARY_DEFAULT_AGENT=growth  # which agent handles diary entries when router returns agent=none
-NOTION_DATA_DIR=./data      # where notion_mcp_token.json is stored
-GMAIL_DATA_DIR=./data       # where gmail_credentials.json and gmail_token.json are stored
+TIMEZONE=Europe/Amsterdam   # IANA timezone for week boundaries (weekly summaries)
 ```
 
 ---
@@ -319,7 +365,6 @@ me-agent/
 ├── .gitignore
 ├── requirements.txt
 ├── README.md
-├── ARCHITECTURE.md                  ← codebase walkthrough for new developers
 ├── data/                            ← persisted data (partially gitignored)
 │   ├── goals/                       ← per-domain goals (gitignored)
 │   │   ├── workout.md
@@ -327,7 +372,9 @@ me-agent/
 │   │   ├── lifestyle.md
 │   │   ├── career.md
 │   │   └── dutch.md
-│   ├── personal_profile.md          ← Xi's profile (auto-injected into every agent)
+│   ├── summaries/                   ← weekly summary files (auto-generated)
+│   │   └── <agent>/<year>-W<week>.md
+│   ├── personal_profile.md          ← auto-injected into every agent's system prompt
 │   ├── diary.md                     ← dated journal entries (written by diary_add)
 │   ├── todo.md                      ← todo list (managed by todo_add / todo_done)
 │   ├── health_summary.md            ← static health export (excluded from context_list)
@@ -343,32 +390,34 @@ me-agent/
 └── app/
     ├── __init__.py
     ├── config.py                    ← env-var loading + validation
-    ├── db.py                        ← SQLite schema (messages, notes, health tables…)
+    ├── db.py                        ← SQLite schema (messages, notes, health, conversation_summaries…)
     ├── audit.py                     ← thread-safe JSONL audit logger
-    ├── debug_log.py                 ← optional full-fidelity debug log (LOG_LEVEL=DEBUG)
-    ├── llm.py                       ← DeepSeek client + tool-calling loop
-    ├── main.py                      ← Telegram bot entry point
+    ├── debug_log.py                 ← optional full-fidelity debug log (LOG_LEVEL=DEBUG only)
+    ├── llm.py                       ← DeepSeek client + tool-calling loop + reply formatters
+    ├── main.py                      ← Telegram bot entry point + command handlers
+    ├── weekly_summary.py            ← background weekly summary generator
+    ├── reminders.py                 ← scheduled reminder checker
     ├── agents/
     │   ├── __init__.py
     │   ├── discovery.py             ← dynamic agent registry (scans data/prompts/)
-    │   ├── dispatch.py              ← two-pass routing + agent persona builder
-    │   └── router.py               ← LLM-based classifier + context assembly
+    │   ├── dispatch.py              ← two-pass routing + agent persona builder + summarisation trigger
+    │   └── router.py                ← LLM classifier + context assembly + conversation summarisation
     └── tools/
         ├── __init__.py              ← imports each integration with guard
-        ├── registry.py             ← @tool decorator, user_id injection
-        ├── pending.py              ← staged-action queue
+        ├── registry.py             ← @tool decorator, user_id/agent injection
+        ├── pending.py              ← staged-action queue (SQLite)
         ├── context.py              ← context_list / context_load (on-demand file loading)
-        ├── notes.py                ← note store, agent memory, feedback
+        ├── notes.py                ← note store, search, agent memory, feedback
         ├── todo.py                 ← todo list (backed by data/todo.md)
         ├── diary.py                ← diary entries (backed by data/diary.md)
-        ├── prompts.py              ← read/propose agent prompt files
+        ├── prompts.py              ← read/propose agent prompt files (staged)
         ├── health.py               ← health data query tools
         ├── notion.py               ← Notion MCP tools
         ├── notion_auth.py          ← one-time OAuth setup for Notion MCP
-        ├── notion_cookie_auth.py   ← legacy cookie-based setup (superseded)
         ├── gmail.py                ← Gmail tools
         ├── gmail_auth.py           ← one-time OAuth setup for Gmail + Calendar
-        ├── calendar.py             ← Google Calendar tools (supports all_day events)
+        ├── calendar.py             ← Google Calendar tools
+        ├── reminders.py            ← reminder_set (staged) and reminder management
         └── files.py                ← local file tools (root: data/ by default)
 ```
 
@@ -384,6 +433,9 @@ me-agent/
 - **Diary entries need `note_add` too.** `diary_add` writes to `diary.md` but the context block is built from the `notes` table. Without an explicit `note_add` call, diary content is invisible to future conversations.
 - **Hallucination guard needs a regex, not keywords.** A keyword list fires on `"I've noted your baseline"` or `"well done"`. A regex matching `I've saved`, `I added`, `I logged` only fires on explicit first-person write claims.
 - **DeepSeek thinking models return `reasoning_content`** which the API requires you to echo back on turn 2+, or you get HTTP 400. Using `msg.model_dump(exclude_none=True)` preserves all extra fields automatically.
+- **Conversation summarisation needs `max_tokens=2000`.** DeepSeek reasoning models spend reasoning tokens before producing content. A 400-token cap is exhausted by `reasoning_content` and returns an empty summary. The larger cap gives headroom for both reasoning and the actual output.
+- **Self-healing summaries.** The summarisation trigger checks `not existing and total >= threshold` — so if a summary is ever deleted from the DB, the very next message re-generates it regardless of whether total is at a boundary. No manual intervention needed.
+- **Empty LLM summaries must be stored, not skipped.** If `_llm_summarise` returns empty and we return `False` without storing, the `not existing + total >= threshold` condition fires on *every subsequent message* — an infinite retry loop. Storing a placeholder breaks the loop; the rolling path overwrites it at the next boundary.
 - **Notion MCP tokens expire hourly.** The `refresh_access_token()` function in `notion_auth.py` refreshes on 401 automatically; no manual re-auth needed.
 - **Health data may be historical.** The `health_workout_sessions` tool uses `MAX(date)` from the table as the reference point rather than `date('now')`, so queries like "last 30 days" work correctly against historical data.
-- **The LLM is not a reliable narrator.** The staged-action footer is the structural source of truth for "what is pending" — shown unconditionally below the LLM's reply text, built from tool return values, not from what the LLM said.
+- **The LLM is not a reliable narrator.** The staged-action footer and write confirmations are the structural source of truth for "what actually happened" — shown unconditionally below the LLM's reply text, built from tool return values, not from what the LLM said.

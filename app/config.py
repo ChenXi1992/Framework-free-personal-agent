@@ -41,6 +41,10 @@ if not ALLOWED_USERS:
 
 # --- Optional ---------------------------------------------------------------
 DB_PATH: str = os.environ.get("DB_PATH", "me.db")
+
+# Tavily web search API key (https://app.tavily.com).
+# Leave blank to disable the web_search tool — the bot starts fine without it.
+TAVILY_API_KEY: str = os.environ.get("TAVILY_API_KEY", "")
 LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 # Model: deepseek-chat (V3, fast/cheap) or deepseek-reasoner (R1, slower/smarter).
@@ -67,9 +71,22 @@ MAX_TOOL_TURNS: int = int(os.environ.get("MAX_TOOL_TURNS", "10"))
 # How many turns of prior conversation to include in each LLM call.
 HISTORY_TURNS: int = int(os.environ.get("HISTORY_TURNS", "20"))
 
+# Conversation summarisation threshold.
+# When an agent's total turn count exceeds this, the oldest turns (beyond the
+# recent 20) are summarised into a single paragraph and injected as persistent
+# context. Summarisation only triggers once per threshold crossing (not every call).
+CONVERSATION_SUMMARY_THRESHOLD: int = int(
+    os.environ.get("CONVERSATION_SUMMARY_THRESHOLD", "40")
+)
+
 # Default agent for diary entries when the router returns agent=none.
 # Override if you've replaced or renamed the growth agent.
 DIARY_DEFAULT_AGENT: str = os.environ.get("DIARY_DEFAULT_AGENT", "growth")
+
+# Timezone for week boundary calculations (weekly summaries).
+# Weekly summaries are generated on Monday 00:00 in this timezone.
+# Any IANA timezone name works: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
+TIMEZONE: str = os.environ.get("TIMEZONE", "Europe/Amsterdam")
 
 # --- Per-component debug logging -------------------------------------------
 # Edit these directly when debugging. All are no-ops unless LOG_LEVEL=DEBUG.
@@ -78,7 +95,7 @@ DIARY_DEFAULT_AGENT: str = os.environ.get("DIARY_DEFAULT_AGENT", "growth")
 # DEBUG_LOG_MESSAGES in particular can produce very large records.
 _IS_DEBUG = LOG_LEVEL == "DEBUG"
 
-DEBUG_LOG_ROUTER:        bool = _IS_DEBUG and True   # router.md prompt + raw response + token usage
+DEBUG_LOG_ROUTER:        bool = _IS_DEBUG and True  # router.md prompt + raw response + token usage
 DEBUG_LOG_AGENT_PROMPT:  bool = _IS_DEBUG and True  # full system prompt (persona.md + context block) — can be large
 DEBUG_LOG_LLM_RESPONSE:  bool = _IS_DEBUG and True   # complete reply text every turn (no 500-char cap)
 DEBUG_LOG_REASONING:     bool = _IS_DEBUG and True  # DeepSeek reasoning_content / thinking tokens — can be very long

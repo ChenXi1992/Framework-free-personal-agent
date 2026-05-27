@@ -259,13 +259,13 @@ def notion_get_page(page_id: str, workspace: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Write tools (non-destructive — execute immediately)
+# Write tools (staged — all Notion mutations require confirmation)
 # ---------------------------------------------------------------------------
 
 @tool(
     description=(
         "Append a paragraph to the bottom of an existing Notion page. "
-        "Existing content is never modified."
+        "STAGED — requires confirmation before writing."
     ),
     parameters={
         "type": "object",
@@ -273,22 +273,34 @@ def notion_get_page(page_id: str, workspace: str) -> dict[str, Any]:
             "page_id":   {"type": "string"},
             "text":      {"type": "string", "description": "Paragraph text to append."},
             "workspace": _WORKSPACE_PARAM,
+            "user_id":   {"type": "integer"},
         },
-        "required": ["page_id", "text", "workspace"],
+        "required": ["page_id", "text", "workspace", "user_id"],
     },
+    destructive=True,
 )
-def notion_append_paragraph(page_id: str, text: str, workspace: str) -> dict[str, Any]:
-    return _safe_call("notion-update-page", {
-        "id":      page_id,
-        "content": text,
-        "mode":    "append",
-    })
+def notion_append_paragraph(page_id: str, text: str, workspace: str, user_id: int) -> dict[str, Any]:
+    # Fetch title for a human-readable preview.
+    page = _safe_call("notion-retrieve-page", {"page_id": page_id})
+    title = _extract_title(page) if "error" not in page else page_id
+    preview = (
+        f"Append to Notion page: \"{title}\"\n"
+        f"  Workspace: {workspace}\n"
+        f"  Text: {text[:200]}{'...' if len(text) > 200 else ''}"
+    )
+    action_id = stage_action(
+        user_id=user_id,
+        tool_name="notion_append_paragraph",
+        arguments={"page_id": page_id, "text": text, "workspace": workspace},
+        preview=preview,
+    )
+    return {"staged": True, "action_id": action_id, "preview": preview}
 
 
 @tool(
     description=(
         "Create a new Notion page as a child of an existing page. "
-        "The parent must be accessible in the authorised workspace."
+        "STAGED — requires confirmation before creating."
     ),
     parameters={
         "type": "object",
@@ -297,29 +309,40 @@ def notion_append_paragraph(page_id: str, text: str, workspace: str) -> dict[str
             "title":          {"type": "string"},
             "body":           {"type": "string", "description": "Optional initial body paragraph."},
             "workspace":      _WORKSPACE_PARAM,
+            "user_id":        {"type": "integer"},
         },
-        "required": ["parent_page_id", "title", "workspace"],
+        "required": ["parent_page_id", "title", "workspace", "user_id"],
     },
+    destructive=True,
 )
 def notion_create_page(
     parent_page_id: str,
     title: str,
     workspace: str,
+    user_id: int,
     body: str = "",
 ) -> dict[str, Any]:
-    children = []
-    if body:
-        children.append({
-            "object": "block",
-            "type": "paragraph",
-            "paragraph": {
-                "rich_text": [{"type": "text", "text": {"content": body}}]
-            },
-        })
-    return _safe_call("notion-create-pages", {
-        "parent": {"page_id": parent_page_id, "type": "page_id"},
-        "pages":  [{"properties": {"title": title}, "content": body}],
-    })
+    # Resolve parent title so the preview shows a readable path, not a UUID.
+    parent_page = _safe_call("notion-retrieve-page", {"page_id": parent_page_id})
+    parent_title = _extract_title(parent_page) if "error" not in parent_page else parent_page_id
+    preview = (
+        f"Create Notion page: \"{title}\"\n"
+        f"  Workspace: {workspace}\n"
+        f"  Parent: \"{parent_title}\"\n"
+        + (f"  Body: {body[:200]}{'...' if len(body) > 200 else ''}" if body else "")
+    )
+    action_id = stage_action(
+        user_id=user_id,
+        tool_name="notion_create_page",
+        arguments={
+            "parent_page_id": parent_page_id,
+            "title":          title,
+            "body":           body,
+            "workspace":      workspace,
+        },
+        preview=preview,
+    )
+    return {"staged": True, "action_id": action_id, "preview": preview}
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +369,7 @@ def notion_archive_page(page_id: str, workspace: str, user_id: int) -> dict[str,
     if "error" in page:
         return page
     title   = _extract_title(page)
-    preview = f"Archive Notion page: \"{title}\" ({page_id})"
+    preview = f"Archive Notion page: \"{title}\"\n  Workspace: {workspace}\n  Page ID: {page_id}"
     action_id = stage_action(
         user_id=user_id,
         tool_name="notion_archive_page",
@@ -381,6 +404,26 @@ def _extract_title(page: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def execute_confirmed(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    if tool_name == "notion_append_paragraph":
+        result = _safe_call("notion-update-page", {
+            "id":      arguments["page_id"],
+            "content": arguments["text"],
+            "mode":    "append",
+        })
+        if "error" in result:
+            return {"ok": False, "error": result["error"]}
+        return {"ok": True}
+
+    if tool_name == "notion_create_page":
+        body = arguments.get("body", "")
+        result = _safe_call("notion-create-pages", {
+            "parent": {"page_id": arguments["parent_page_id"], "type": "page_id"},
+            "pages":  [{"properties": {"title": arguments["title"]}, "content": body}],
+        })
+        if "error" in result:
+            return {"ok": False, "error": result["error"]}
+        return {"ok": True}
+
     if tool_name == "notion_archive_page":
         result = _safe_call("notion-move-pages", {
             "page_or_database_ids": [arguments["page_id"]],

@@ -1,13 +1,13 @@
-"""Two-pass agent router.
+"""Agent router: classification and context assembly.
 
-Pass 1 — Router LLM call:
-    Classifies the user message into {type, agent, category, summary} using router.md.
-    For notes, summary is a one-liner stored in the notes table.
-    No separate classifier call needed — router handles both routing and summarisation.
+Pass 1 — Router LLM call (route()):
+    Single LLM call classifies the user message into {type, agent, category, summary}.
+    Types: note | diary | chat.
+    For notes, summary is a router-generated one-liner stored directly in the notes table.
 
-Pass 2 — Agent LLM call (or direct reply for general):
-    Builds context from per-agent history + relevant notes, injects persona prompt,
-    runs the main tool-calling loop.
+Pass 2 — Context assembly (_build_agent_context()):
+    Injects today's date, recent notes, personal profile, and agent-specific goals
+    into the agent system prompt before the main tool-calling loop runs.
 """
 from __future__ import annotations
 
@@ -16,13 +16,12 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any
 
 from openai import OpenAI, OpenAIError
 
 from ..config import (
     DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL,
-    DEBUG_LOG_ROUTER,
+    DEBUG_LOG_ROUTER, CONVERSATION_SUMMARY_THRESHOLD,
 )
 from .. import audit, db, debug_log
 from ..db import _utc_now
@@ -93,8 +92,6 @@ def _load_prompt(name: str) -> str:
         from .discovery import build_agents_block
         text = text.replace("{{AGENTS}}", build_agents_block())
     return text
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -273,11 +270,18 @@ def _build_agent_context(agent: str, category: str) -> str:
     if goals_path.exists():
         parts.append(f"## {agent.capitalize()} goals\n{goals_path.read_text(encoding='utf-8').strip()}")
 
-    # NOTE: conversation history is NOT injected here as a text block.
-    # dispatch.py passes the actual agent_conversations rows as properly-formatted
-    # OpenAI messages (role/content pairs) in the messages array sent to the LLM.
-    # Injecting a truncated text digest here as well would duplicate the same data,
-    # waste tokens on every call, and risk confusing the model with two versions.
+    # Inject any stored conversation summary (older turns compressed into a paragraph).
+    # Recent raw turns are passed as OpenAI messages by dispatch.py; the summary
+    # covers everything older than the rolling window so nothing is silently lost.
+    summary_data = get_agent_summary(agent)
+    if summary_data and summary_data["summary"]:
+        ts_from = datetime.datetime.utcfromtimestamp(summary_data["ts_from"]).strftime("%b %d")
+        ts_to   = datetime.datetime.utcfromtimestamp(summary_data["ts_to"]).strftime("%b %d")
+        parts.append(
+            f"## Conversation history\n"
+            f"Summary of earlier conversations ({summary_data['turns_count']} turns, {ts_from}–{ts_to}):\n"
+            f"{summary_data['summary']}"
+        )
 
     return "\n\n".join(parts)
 
@@ -287,7 +291,7 @@ def _build_agent_context(agent: str, category: str) -> str:
 # ---------------------------------------------------------------------------
 
 def agent_message_history(agent: str, limit: int = 20) -> list[dict[str, str]]:
-    """Return recent agent turns as OpenAI-format messages."""
+    """Return the most recent `limit` agent turns as OpenAI-format messages."""
     with db._connect() as conn:
         rows = conn.execute(
             "SELECT role, content FROM agent_conversations "
@@ -308,3 +312,148 @@ def store_turn(agent: str, role: str, content: str) -> None:
             "INSERT INTO agent_conversations(ts, created_at, agent, role, content) VALUES (?,?,?,?,?)",
             (int(time.time()), _utc_now(), agent, role, content),
         )
+
+
+# ---------------------------------------------------------------------------
+# Conversation summarisation
+# ---------------------------------------------------------------------------
+
+def get_agent_summary(agent: str) -> dict | None:
+    """Return the stored conversation summary for this agent, or None if none exists."""
+    with db._connect() as conn:
+        row = conn.execute(
+            "SELECT summary, ts_from, ts_to, turns_count FROM conversation_summaries WHERE agent = ?",
+            (agent,),
+        ).fetchone()
+    if not row:
+        return None
+    return {"summary": row[0], "ts_from": row[1], "ts_to": row[2], "turns_count": row[3]}
+
+
+def summarise_if_needed(agent: str) -> bool:
+    """Summarise agent history at every 20-turn boundary above the threshold.
+
+    Returns True if a new summary was generated this call, False otherwise.
+    This is a no-op (single COUNT query) when below the threshold or not
+    at a 20-turn boundary.
+
+    Trigger: total % 20 == 0 AND total >= CONVERSATION_SUMMARY_THRESHOLD.
+    Fires at turns 40, 60, 80, 100…
+
+    What the summary covers: everything from turn 1 to current total, so it
+    always reflects the full conversation history at the time of each trigger.
+
+    Implementation: rolling — feeds (previous summary + latest 20 turns) to
+    the LLM rather than all raw turns. This keeps the input small regardless
+    of how long the conversation grows.
+    """
+    _RECENT_TURNS = 20
+
+    with db._connect() as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM agent_conversations WHERE agent = ?",
+            (agent,),
+        ).fetchone()[0]
+
+    existing = get_agent_summary(agent)
+
+    # Determine whether to fire:
+    # - No existing summary + total >= threshold → fire immediately (first-ever or
+    #   after a summary was cleared). Fetches all turns so nothing is lost.
+    # - Existing summary + at a 20-turn boundary → rolling update.
+    # - Anything else → no-op.
+    if not existing and total >= CONVERSATION_SUMMARY_THRESHOLD:
+        pass  # fall through to first-trigger path
+    elif existing and total >= CONVERSATION_SUMMARY_THRESHOLD and total % _RECENT_TURNS == 0:
+        pass  # fall through to rolling path
+    else:
+        return False
+
+    if existing:
+        # Subsequent triggers: rolling — previous summary + latest 20 delta turns.
+        # Keeps LLM input small regardless of total history length.
+        with db._connect() as conn:
+            delta_rows = conn.execute(
+                "SELECT ts, role, content FROM agent_conversations "
+                "WHERE agent = ? ORDER BY ts DESC LIMIT ?",
+                (agent, _RECENT_TURNS),
+            ).fetchall()
+        delta_rows = list(reversed(delta_rows))
+        if not delta_rows:
+            return False
+        turns_text = (
+            f"Previous summary:\n{existing['summary']}\n\nNew turns:\n"
+            + "\n".join(f"{r[1].upper()}: {r[2]}" for r in delta_rows)
+        )
+        ts_from = existing["ts_from"]
+        ts_to   = delta_rows[-1][0]
+    else:
+        # First trigger: no prior summary — fetch ALL turns so nothing is lost.
+        with db._connect() as conn:
+            all_rows = conn.execute(
+                "SELECT ts, role, content FROM agent_conversations "
+                "WHERE agent = ? ORDER BY ts ASC",
+                (agent,),
+            ).fetchall()
+        if not all_rows:
+            return False
+        turns_text = "\n".join(f"{r[1].upper()}: {r[2]}" for r in all_rows)
+        ts_from = all_rows[0][0]
+        ts_to   = all_rows[-1][0]
+
+    summary_text = _llm_summarise(agent, turns_text, total)
+
+    if not summary_text:
+        # Store a placeholder so existing is non-None on the next call — prevents
+        # an infinite retry loop where every message re-triggers the LLM call.
+        # The rolling path will overwrite this placeholder at the next 20-turn boundary.
+        log.warning("Empty summary from LLM for %s agent — storing placeholder", agent)
+        summary_text = "(Summary temporarily unavailable — will update at next boundary.)"
+
+    with db._connect() as conn:
+        conn.execute(
+            """INSERT INTO conversation_summaries(agent, ts_from, ts_to, turns_count, summary, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(agent) DO UPDATE SET
+                   ts_from=excluded.ts_from,
+                   ts_to=excluded.ts_to,
+                   turns_count=excluded.turns_count,
+                   summary=excluded.summary,
+                   created_at=excluded.created_at""",
+            (agent, ts_from, ts_to, total, summary_text, _utc_now()),
+        )
+
+    log.info("Updated conversation summary for %s agent (total %d turns)", agent, total)
+    return True
+
+
+def _llm_summarise(agent: str, turns_text: str, count: int) -> str:
+    """Call the LLM to summarise a block of conversation turns into one paragraph.
+
+    Uses temperature=0.0 for deterministic output and a small max_tokens cap —
+    the summary should be concise (3–6 sentences), not a verbatim transcript.
+    """
+    system = (
+        f"You are maintaining a running summary of a conversation with the {agent} agent "
+        "for a personal AI assistant. You will receive either raw conversation turns, or a "
+        "previous summary followed by new turns. Produce an updated single paragraph that "
+        "captures the full history — incorporating the previous summary and merging in new "
+        "facts, decisions, goals, numbers, and commitments. "
+        "Be specific — keep dates, numbers, and names. "
+        "Write in second person ('You have been…', 'You agreed…'). Plain text only, no bullets."
+    )
+    user = f"Update the summary to cover all {count} turns:\n\n{turns_text}"
+    try:
+        resp = _client.chat.completions.create(
+            model=DEEPSEEK_MODEL,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user",   "content": user},
+            ],
+            temperature=0.0,
+            max_tokens=2000,  # reasoning model consumes tokens before content — needs headroom
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:  # noqa: BLE001
+        log.warning("Conversation summarisation failed: %s", e)
+        return f"(Summary unavailable: {e})"

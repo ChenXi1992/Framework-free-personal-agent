@@ -33,6 +33,7 @@ data/goals/
 data/health_summary.md
 data/diary.md
 data/todo.md
+data/summaries/
 
 # ── Runtime logs — generated at runtime, never commit ─────────────────────────
 data/agent.log.json

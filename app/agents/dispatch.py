@@ -1,15 +1,32 @@
-"""Main dispatch entry point.
+"""Agent dispatch: routes each user message to the right specialist agent.
 
-Replaces the direct `llm.chat()` call in main.py for messages that go through
-the self-help agent system. Falls back to the default llm.chat() for chat
-messages with no specific agent.
+Every message from main.py flows through handle() here. This module owns the
+full pipeline from raw text to ChatResult:
 
-Flow:
-    1. router.route(message) → {type, agent, category}
-    2a. type == "note": classify → store note → optionally respond
-    2b. type == "diary": build persona context → diary instruction → agent llm.chat()
-    2c. type == "chat" with agent: build persona context → agent llm.chat()
-    2d. agent == "none": default llm.chat()
+  1. Router classification
+     router.route(message) → {type, agent, category}
+     - "note"  → store to DB immediately; agent responds without note_add tool
+     - "diary" → agent handles everything (diary_add + note_add + response)
+     - "chat"  → normal conversation with the matched specialist agent
+     - agent == "none" → general LLM with no specialist persona
+
+  2. Sticky-agent fallback
+     Short ambiguous messages (≤ 5 words: "Yes", "OK", "Go ahead") are
+     forwarded to the last active agent when the router returns none,
+     so follow-ups resolve in context rather than falling through to general.
+
+  3. Conversation summarisation (no-op unless history is long)
+     Fires before building the persona so any newly generated summary is
+     already in the system prompt for this very call.
+
+  4. Persona + context assembly
+     Combines the agent's persona file (data/prompts/<agent>.md) with a
+     dynamically built context block: today's date, recent notes, personal
+     profile, goals, and the rolling conversation summary.
+
+  5. LLM call (llm.chat) using the agent's own message history (last 20 turns).
+
+  6. Persist the exchange and return (ChatResult, agent_name).
 """
 from __future__ import annotations
 
@@ -17,12 +34,12 @@ import datetime
 import logging
 import time
 from pathlib import Path
-from typing import Any
+from typing import Callable
 
 from .. import audit, db, debug_log
 from ..config import DEBUG_LOG_AGENT_PROMPT, DIARY_DEFAULT_AGENT
 from ..db import _utc_now
-from ..llm import ChatResult, chat
+from ..llm import ChatResult, ToolInvocation, chat
 from . import router as _router
 
 log = logging.getLogger(__name__)
@@ -115,6 +132,7 @@ def handle(
     user_message: str,
     user_id: int,
     global_history: list[dict[str, str]],
+    on_chunk: Callable[[list[ToolInvocation], str], None] | None = None,
 ) -> tuple[ChatResult, str]:
     """Process one user message through the routing + agent system.
 
@@ -211,10 +229,18 @@ def handle(
     # --- General (no specific agent) ---
     if agent == "none":
         result = chat(global_history, user_id=user_id,
-                      system_prompt=_build_general_prompt(), agent="general")
+                      system_prompt=_build_general_prompt(), agent="general",
+                      on_chunk=on_chunk)
         return result, "none"
 
     # --- Agent-specific ---
+
+    # Summarise old turns if history is getting long (no-op if under threshold).
+    # Must run BEFORE _build_persona so the summary is already stored when
+    # _build_agent_context() calls get_agent_summary() to inject it into the
+    # system prompt this same call.
+    did_summarise = _router.summarise_if_needed(agent)
+
     persona_prompt = _build_persona(agent, category)
     agent_history = _router.agent_message_history(agent, limit=20)
 
@@ -234,17 +260,40 @@ def handle(
             + user_message
         )
     else:
+        # type == "note": note already stored by dispatch; note_add excluded below.
+        # type == "chat": plain conversation, no special wrapping needed.
         content_for_agent = user_message
 
     # Merge: start from agent's own history, append the new user message.
     messages_for_agent = [*agent_history, {"role": "user", "content": content_for_agent}]
 
+    # For note-type messages the note is already stored by dispatch — exclude
+    # note_add so the agent physically cannot create a duplicate.
+    excluded = frozenset({"note_add"}) if msg_type == "note" else frozenset()
+
     result = chat(messages_for_agent, user_id=user_id,
-                  system_prompt=persona_prompt, agent=agent)
+                  system_prompt=persona_prompt, agent=agent,
+                  exclude_tools=excluded, on_chunk=on_chunk)
 
     # Persist this turn in agent conversation memory
     _router.store_turn(agent, "user", user_message)
     _router.store_turn(agent, "assistant", result.text)
+
+    # If summarisation fired this turn, notify the user.
+    # When on_chunk is active all content goes through that channel — we send
+    # the note via on_chunk so it reaches Telegram immediately. When on_chunk
+    # is absent (fallback path) we append to result.text instead.
+    if did_summarise:
+        summary_data = _router.get_agent_summary(agent)
+        count = summary_data["turns_count"] if summary_data else "?"
+        note = f"_📝 Summarised {count} turns into memory._"
+        if on_chunk:
+            on_chunk([], note)
+        result = ChatResult(
+            text=result.text + f"\n\n{note}",
+            invocations=result.invocations,
+            interim_texts=result.interim_texts,
+        )
 
     return result, agent
 

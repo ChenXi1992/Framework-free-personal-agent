@@ -17,6 +17,8 @@ Examples:
 - "I slept only 5 hours last night" → note/lifestyle
 - "Spent 4 hours on my phone today" → note/lifestyle
 - "Record that I had a difficult meeting with my manager" → note/career
+- "Log lingq 23mins today" → note/dutch
+- "Did 30 min Duolingo" → note/dutch
 
 **diary** — A narrative day summary or personal journal entry the user wants written
 to their diary. More than a note — it tells a story or describes an experience, not just
@@ -53,6 +55,16 @@ Example: "I ran 5km today — can you add a run to my calendar for Thursday?" �
 
 **Sleep:** hours slept / sleep schedule → lifestyle. Quality issues linked to stress or mood → growth.
 
+**Dutch learning apps:** Any mention of LingQ, Duolingo, Anki, Pimsleur, Babbel, italki,
+language exchange, Dutch podcast, Dutch book, Dutch TV/film (with subtitles), Dutch words,
+Dutch grammar, Dutch vocabulary → **dutch**. This applies to all message types:
+logging time spent ("LingQ 23 min"), asking questions ("how do I use LingQ"), and notes.
+Examples:
+- "Log lingq 23mins today" → note/dutch
+- "Did 30 min Duolingo" → note/dutch
+- "Reviewed Anki cards for 15 min" → note/dutch
+- "Watched a Dutch YouTube video" → note/dutch
+
 **Goals:** adding/saving/updating a goal → always `chat`. Route to the agent that matches
 the goal's domain:
 - Personal development / mindset / people-pleasing → growth
@@ -66,6 +78,20 @@ not chat. The phrasing doesn't change the intent.
 
 **Short follow-ups** ("yes", "sounds good", "let's do it", "ok") with no clear agent
 signal → agent=none. The system will inherit the previous agent automatically.
+
+## Tool limitation transparency (CRITICAL)
+
+When a tool has a known limitation that prevents fulfilling the user's request, state it
+immediately — do NOT try workaround after workaround hoping one will stick. The user should
+know the constraint on the first or second turn, not after 10+ messages.
+
+Examples of limitations to flag early:
+- Notion API cannot filter pages by creator ("Private" vs "Recents")
+- Notion API cannot move/reparent existing pages
+- Any other tool constraint that makes the request partially or fully impossible
+
+Say: "The [tool] can't [X]. Here's what we can do instead: [options A, B, C]."
+Then let the user choose — don't guess which workaround they'd prefer.
 
 ## Summary (notes only)
 

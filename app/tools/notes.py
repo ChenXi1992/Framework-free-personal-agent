@@ -144,13 +144,13 @@ def notes_search(query: str, category: str = "all", limit: int = 10) -> dict[str
     parameters={
         "type": "object",
         "properties": {
-            "agent":   {"type": "string", "enum": _AGENTS,
-                        "description": "The agent this conversation belongs to."},
+            "agent":   {"type": "string"},  # injected server-side — hidden from LLM
             "role":    {"type": "string", "enum": ["user", "assistant"]},
             "content": {"type": "string"},
         },
         "required": ["agent", "role", "content"],
     },
+    agent_scoped=True,
 )
 def conversation_add(agent: str, role: str, content: str) -> dict[str, Any]:
     """Persist one conversation turn for a specific agent."""
@@ -164,18 +164,18 @@ def conversation_add(agent: str, role: str, content: str) -> dict[str, Any]:
 
 @tool(
     description=(
-        "Retrieve recent conversation history for a specific agent. "
+        "Retrieve recent conversation history for this agent. "
         "Returns turns in chronological order (oldest first)."
     ),
     parameters={
         "type": "object",
         "properties": {
-            "agent": {"type": "string", "enum": _AGENTS,
-                      "description": "The agent whose history to retrieve."},
+            "agent": {"type": "string"},  # injected server-side — hidden from LLM
             "limit": {"type": "integer", "description": "Max turns to return (default 20)."},
         },
         "required": ["agent"],
     },
+    agent_scoped=True,
 )
 def conversation_recent(agent: str, limit: int = 20) -> dict[str, Any]:
     """Return the most recent conversation turns for an agent, oldest-first."""

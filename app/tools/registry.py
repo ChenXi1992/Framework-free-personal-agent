@@ -23,22 +23,23 @@ class Tool:
     fn: Callable[..., Any]
     description: str
     parameters: dict[str, Any]
-    destructive: bool = False  # if True, must go through pending-action flow
+    destructive: bool = False   # if True, must go through pending-action flow
+    agent_scoped: bool = False  # if True, `agent` is injected server-side (hidden from LLM)
 
     def to_openai(self) -> dict[str, Any]:
-        # Hide `user_id` from the LLM. It's an agent-loop-injected field, not
-        # something the model should ever see or guess. If we left it in the
-        # schema (as we did initially), DeepSeek would fill it in with a
-        # hallucinated number, and the staged action would belong to a
-        # phantom user — breaking /confirm ownership checks.
+        # Hide server-injected fields from the LLM schema.
+        # `user_id` — injected for destructive tools; LLM must never guess it.
+        # `agent`   — injected for agent_scoped tools; LLM knows its own name
+        #             but injecting it prevents hallucination and keeps schemas clean.
+        _hidden = {"user_id", "agent"}
         params = self.parameters
         props = params.get("properties", {})
         required = params.get("required", [])
-        if "user_id" in props or "user_id" in required:
+        if _hidden & (set(props) | set(required)):
             params = {
                 **params,
-                "properties": {k: v for k, v in props.items() if k != "user_id"},
-                "required": [r for r in required if r != "user_id"],
+                "properties": {k: v for k, v in props.items() if k not in _hidden},
+                "required": [r for r in required if r not in _hidden],
             }
         return {
             "type": "function",
@@ -58,6 +59,7 @@ def tool(
     description: str,
     parameters: dict[str, Any],
     destructive: bool = False,
+    agent_scoped: bool = False,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Register a Python function as an LLM-callable tool.
 
@@ -79,6 +81,7 @@ def tool(
             description=description,
             parameters=parameters,
             destructive=destructive,
+            agent_scoped=agent_scoped,
         )
         return fn
 

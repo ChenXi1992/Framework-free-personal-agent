@@ -123,6 +123,41 @@ CREATE TABLE IF NOT EXISTS sport_minute (
     duration_min  INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_sm_date ON sport_minute(date);
+
+CREATE TABLE IF NOT EXISTS reminders (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          INTEGER NOT NULL,
+    created_at  TEXT    NOT NULL,
+    agent       TEXT    NOT NULL,
+    label       TEXT    NOT NULL,
+    days        TEXT    NOT NULL,  -- comma-separated: "wednesday,friday" or "daily"
+    fire_time   TEXT    NOT NULL,  -- "HH:MM" in user's local timezone
+    active      INTEGER NOT NULL DEFAULT 1,
+    last_fired  TEXT               -- "YYYY-MM-DD" — prevents double-fire on same day
+);
+
+CREATE TABLE IF NOT EXISTS weekly_summaries (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          INTEGER NOT NULL,
+    created_at  TEXT    NOT NULL,
+    agent       TEXT    NOT NULL,
+    year        INTEGER NOT NULL,
+    week        INTEGER NOT NULL,
+    summary     TEXT    NOT NULL,
+    UNIQUE(agent, year, week)
+);
+CREATE INDEX IF NOT EXISTS idx_weekly_summaries_agent
+    ON weekly_summaries(agent, year, week);
+
+CREATE TABLE IF NOT EXISTS conversation_summaries (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent       TEXT    NOT NULL UNIQUE,   -- one active summary per agent
+    ts_from     INTEGER NOT NULL,          -- unix ts of oldest turn covered
+    ts_to       INTEGER NOT NULL,          -- unix ts of newest turn covered
+    turns_count INTEGER NOT NULL,          -- how many turns were summarised
+    summary     TEXT    NOT NULL,
+    created_at  TEXT    NOT NULL
+);
 """
 
 # Migrations: ALTER TABLE statements to add new columns to databases that were

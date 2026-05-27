@@ -22,7 +22,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from openai import OpenAI, OpenAIError
 
@@ -91,9 +91,15 @@ class ToolInvocation:
 
 @dataclass
 class ChatResult:
-    """What the agent loop returns: final text + everything that happened."""
+    """What the agent loop returns: final text + everything that happened.
+
+    `interim_texts` collects any text the LLM emitted *alongside* a tool-call
+    turn (i.e. turns where has_tool_calls=True and msg.content is non-empty).
+    These are displayed to the user before the final reply so nothing is lost.
+    """
     text: str
     invocations: list[ToolInvocation] = field(default_factory=list)
+    interim_texts: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +111,8 @@ def chat(
     user_id: int,
     system_prompt: str | None = None,
     agent: str = "",
+    exclude_tools: frozenset[str] = frozenset(),
+    on_chunk: Callable[[list[ToolInvocation], str], None] | None = None,
 ) -> ChatResult:
     """Run the agent loop for one user turn.
 
@@ -114,15 +122,26 @@ def chat(
     an agent persona should be injected instead. `agent` is the name of the
     active specialist agent (or empty string for general chat) — recorded in
     the audit log so you can filter by agent.
+
+    `on_chunk` is an optional sync callback called after each completed LLM
+    turn with (turn_invocations, text). When provided, every turn's output is
+    delivered immediately — callers should NOT re-render interim_texts from
+    ChatResult (they've already been sent). The callback is NOT called for
+    turns that produce tool calls but no text.
     """
     invocations: list[ToolInvocation] = []
+    interim_texts: list[str] = []
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt or SYSTEM_PROMPT},
         *history,
     ]
-    tools_payload = registry.all_openai_tools()
+    tools_payload = [
+        t for t in registry.all_openai_tools()
+        if t["function"]["name"] not in exclude_tools
+    ]
 
     for turn in range(MAX_TOOL_TURNS):  # cap imported from config
+        turn_invocations: list[ToolInvocation] = []  # reset each turn for per-turn callbacks
         # Debug: full messages array sent to the API this turn.
         if DEBUG_LOG_MESSAGES:
             debug_log.log(
@@ -254,10 +273,23 @@ def chat(
         messages.append(assistant_entry)
 
         if not msg.tool_calls:
+            final_text = msg.content or "[empty response]"
+            if on_chunk:
+                # Fire the final chunk immediately; caller sends it directly.
+                on_chunk(turn_invocations, final_text)
             return ChatResult(
-                text=msg.content or "[empty response]",
+                text=final_text,
                 invocations=invocations,
+                interim_texts=[] if on_chunk else interim_texts,
             )
+
+        # LLM emitted text alongside tool calls — deliver or buffer it.
+        if msg.content and msg.content.strip():
+            interim_text = msg.content.strip()
+            if on_chunk:
+                on_chunk(turn_invocations, interim_text)
+            else:
+                interim_texts.append(interim_text)
 
         # Execute each tool call
         for tc in msg.tool_calls:
@@ -270,12 +302,14 @@ def chat(
                 result: Any = {"error": f"invalid arguments JSON: {e}"}
                 ok = False
             else:
-                # Inject user_id for destructive tools that need it. Always
-                # override — the LLM never sees this param (it's filtered out
-                # by registry.Tool.to_openai), so anything the model put here
-                # is a hallucination and must be replaced.
-                if name in registry.REGISTRY and registry.REGISTRY[name].destructive:
-                    args["user_id"] = user_id
+                # Inject server-side fields the LLM never sees in the schema.
+                # Always override — anything the model put here is a hallucination.
+                if name in registry.REGISTRY:
+                    t = registry.REGISTRY[name]
+                    if t.destructive:
+                        args["user_id"] = user_id
+                    if t.agent_scoped:
+                        args["agent"] = agent
                 try:
                     result = registry.dispatch(name, args)
                     ok = not (isinstance(result, dict) and "error" in result)
@@ -285,10 +319,12 @@ def chat(
                     ok = False
 
             duration_ms = (time.monotonic() - t0) * 1000.0
-            invocations.append(ToolInvocation(
+            inv = ToolInvocation(
                 name=name, arguments=args, result=result,
                 duration_ms=duration_ms, ok=ok,
-            ))
+            )
+            invocations.append(inv)
+            turn_invocations.append(inv)
 
             # Audit: full args + result (truncated by audit._truncate)
             audit.log_event(
@@ -309,9 +345,13 @@ def chat(
             })
 
     log.warning("Hit MAX_TOOL_TURNS=%s without a final answer", MAX_TOOL_TURNS)
+    cap_text = "[stopped: too many tool turns. Try a more specific question.]"
+    if on_chunk:
+        on_chunk(turn_invocations, cap_text)
     return ChatResult(
-        text="[stopped: too many tool turns. Try a more specific question.]",
+        text=cap_text,
         invocations=invocations,
+        interim_texts=[] if on_chunk else interim_texts,
     )
 
 
@@ -331,6 +371,15 @@ def _summarise_result(r: Any) -> str:
     """One-line gist of a tool result for the debug header."""
     if not isinstance(r, dict):
         s = str(r)
+        lines = s.splitlines()
+        if len(lines) > 1:
+            # Multiline string (e.g. file_read content, file_list output).
+            # Show the first line trimmed + how many more lines follow.
+            first = lines[0].strip()
+            if len(first) > 60:
+                first = first[:57] + "..."
+            return f"{first} (+{len(lines) - 1} lines)"
+        # Single-line string — just truncate.
         return s[:60] + ("..." if len(s) > 60 else "")
     if r.get("staged"):
         return f"staged {r.get('action_id', '?')}"
@@ -404,3 +453,25 @@ def format_staged_footer(
         parts.append(preview)
         parts.append(f"→ /confirm {aid}   |   /cancel {aid}")
     return "\n".join(parts)
+
+
+# Tools whose invocations are always shown to the user, regardless of LOG_LEVEL.
+# These are local write tools where a hallucination claim ("I saved your note")
+# can't be verified from the LLM text alone — the user needs ground-truth
+# confirmation that the tool actually ran and returned ok.
+_WRITE_CONFIRM_TOOLS = {"note_add", "diary_add", "todo_add"}
+
+
+def format_write_confirmation(invocations: list[ToolInvocation]) -> str:
+    """Return a compact confirmation line for every note/diary/todo write.
+
+    Shown unconditionally (not gated on SHOW_TOOL_CALLS / LOG_LEVEL) so the
+    user always knows whether data was actually saved or the LLM hallucinated.
+    Format mirrors the debug header so it's easy to read but stays concise.
+    """
+    lines = [
+        _format_invocation(inv)
+        for inv in invocations
+        if inv.name in _WRITE_CONFIRM_TOOLS
+    ]
+    return "\n".join(lines)

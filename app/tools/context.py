@@ -32,9 +32,14 @@ _EXCLUDED = {
 
 
 def _available() -> list[str]:
-    """Return sorted list of loadable .md filenames in data/."""
+    """Return sorted list of loadable .md files in data/, including subdirectories.
+
+    Paths are returned relative to data/ (e.g. 'goals/dutch.md') so the agent
+    can pass them directly to context_load().
+    """
     return sorted(
-        p.name for p in _DATA_DIR.glob("*.md")
+        str(p.relative_to(_DATA_DIR))
+        for p in _DATA_DIR.rglob("*.md")
         if p.name not in _EXCLUDED and p.is_file()
     )
 
@@ -83,9 +88,11 @@ def context_list() -> dict:
 )
 def context_load(filename: str) -> str:
     """Read and return the contents of a context file from data/."""
-    # Prevent path traversal — only allow plain filenames, no slashes.
-    if "/" in filename or "\\" in filename or ".." in filename:
-        raise ValueError(f"Invalid filename {filename!r}. Only plain filenames are allowed.")
+    # Prevent path traversal — block explicit traversal sequences.
+    # Forward slashes are allowed (e.g. 'goals/dutch.md'); the resolve()+startswith()
+    # check below is the real security guarantee.
+    if "\\" in filename or ".." in filename:
+        raise ValueError(f"Invalid filename {filename!r}.")
     path = (_DATA_DIR / filename).resolve()
     if not str(path).startswith(str(_DATA_DIR.resolve())):
         raise ValueError(f"Path {filename!r} escapes the data directory.")

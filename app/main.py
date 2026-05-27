@@ -1,15 +1,32 @@
 """Telegram bot entrypoint.
 
-Uses long polling so the bot needs no inbound network access — your NAS
-reaches out to Telegram, not the other way around.
+Receives messages via long polling (no inbound port required — works behind
+any NAT/firewall) and routes them through the agent dispatch system.
 
-New in this revision:
-- `chat()` runs an agent loop with tool calls (Notion, etc.).
-- `/confirm <id>` and `/cancel <id>` execute or discard pending destructive
-  actions staged by tools like `notion_archive_page`.
+Architecture overview
+─────────────────────
+1. Every plain-text message enters handle_msg().
+2. Plain-text "confirm"/"cancel" shortcuts are intercepted before routing.
+3. Real messages → dispatch.handle() → specialist agent or general LLM.
+4. Responses are streamed to Telegram turn-by-turn via the _on_chunk callback
+   so the user sees partial results immediately rather than waiting for the
+   full agent loop to complete.
+5. Destructive tool actions (send email, create calendar event, etc.) are
+   *staged* — nothing executes until the user sends /confirm <id>.
+6. Weekly summaries fire as a background asyncio task after each reply so
+   they never add latency to the conversation.
+
+Commands
+────────
+/start          — welcome message + command list
+/tools          — list every registered tool
+/reset          — clear conversation memory for this session
+/confirm [id]   — execute a staged destructive action (id optional if only one pending)
+/cancel  [id]   — discard a staged action
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -29,9 +46,11 @@ from telegram.ext import (
 from . import audit
 from .config import AGENT_TEMPERATURE, ALLOWED_USERS, DEEPSEEK_MODEL, HISTORY_TURNS, LOG_LEVEL, MAX_TOOL_TURNS, TELEGRAM_BOT_TOKEN
 from .db import init as db_init, log_message, recent_history
-from .llm import format_debug_header, format_staged_footer
+from .llm import format_debug_header, format_staged_footer, format_write_confirmation
 from .tools import pending  # ensures pending table is created
 from .agents.dispatch import handle as agent_handle
+from .weekly_summary import check_and_send as _check_weekly_summaries
+from .reminders import check_due_reminders
 
 
 # ---------------------------------------------------------------------------
@@ -147,11 +166,12 @@ def _safe_import(modname: str):
         return None
 
 
-notion_tools   = _safe_import("notion")
-gmail_tools    = _safe_import("gmail")
-calendar_tools = _safe_import("calendar")
-file_tools     = _safe_import("files")
-prompt_tools   = _safe_import("prompts")
+notion_tools    = _safe_import("notion")
+gmail_tools     = _safe_import("gmail")
+calendar_tools  = _safe_import("calendar")
+file_tools      = _safe_import("files")
+prompt_tools    = _safe_import("prompts")
+reminder_tools  = _safe_import("reminders")
 
 # Show every tool invocation as a header line on each Telegram reply when
 # logging is at DEBUG level. Off in INFO/WARNING because it's chatty for
@@ -168,7 +188,9 @@ SHOW_TOOL_CALLS = LOG_LEVEL == "DEBUG"
 # (3) registering the tool_name here.
 EXECUTORS: dict[str, callable] = {}
 if notion_tools:
-    EXECUTORS["notion_archive_page"] = notion_tools.execute_confirmed
+    EXECUTORS["notion_append_paragraph"] = notion_tools.execute_confirmed
+    EXECUTORS["notion_create_page"]      = notion_tools.execute_confirmed
+    EXECUTORS["notion_archive_page"]     = notion_tools.execute_confirmed
 if gmail_tools:
     EXECUTORS["gmail_send_message"] = gmail_tools.execute_confirmed
 if calendar_tools:
@@ -180,6 +202,8 @@ if file_tools:
     EXECUTORS["file_append"] = file_tools.execute_confirmed
 if prompt_tools:
     EXECUTORS["prompt_propose"] = prompt_tools.execute_confirmed
+if reminder_tools:
+    EXECUTORS["reminder_set"] = reminder_tools.execute_confirmed
 
 
 # ---------------------------------------------------------------------------
@@ -376,8 +400,42 @@ async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     history = _trim_after_reset(recent_history(user_id, limit=HISTORY_TURNS))
 
+    # Build a per-turn callback that sends each chunk immediately as it
+    # completes, rather than buffering everything to the end.
+    # chat() runs in a thread (via run_in_executor); run_coroutine_threadsafe
+    # bridges back to the async event loop so we can call reply_text() safely.
+    _event_loop = asyncio.get_running_loop()
+
+    def _on_chunk(turn_invocations, chunk_text: str) -> None:
+        sections: list[str] = []
+        if SHOW_TOOL_CALLS and turn_invocations:
+            sections.append(format_debug_header(turn_invocations))
+        # Always show note/diary/todo write confirmations so the user has
+        # ground-truth proof the tool actually ran — independent of LOG_LEVEL.
+        write_conf = format_write_confirmation(turn_invocations)
+        if write_conf:
+            sections.append(write_conf)
+        if chunk_text:
+            sections.append(chunk_text)
+        if not sections:
+            return
+        out = "\n———\n".join(sections)
+        if len(out) > _TELEGRAM_LIMIT:
+            out = out[: _TELEGRAM_LIMIT - 3] + "..."
+        # Fire-and-forget: schedule the send on the event loop and return
+        # immediately so the worker thread can start the next LLM turn.
+        # Coroutines are queued in submission order so messages arrive in order.
+        asyncio.run_coroutine_threadsafe(msg.reply_text(out), _event_loop)
+
     # Two-pass routing: classify → agent dispatch (or general llm).
-    result, routed_agent = agent_handle(text, user_id=user_id, global_history=history)
+    # Run in a thread executor so the event loop stays free to service the
+    # reply_text() calls that _on_chunk fires via run_coroutine_threadsafe.
+    # Without run_in_executor, agent_handle blocks the event loop thread and
+    # _on_chunk's future.result() deadlocks waiting for the loop to run.
+    result, routed_agent = await _event_loop.run_in_executor(
+        None,
+        lambda: agent_handle(text, user_id=user_id, global_history=history, on_chunk=_on_chunk),
+    )
 
     # Persist only the assistant's natural-language text. The invocation list
     # is fully captured in audit.log_event("tool_call", ...) per turn.
@@ -419,25 +477,39 @@ async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             "(tools called: %s)",
             routed_agent, _tools_called or "none",
         )
+        # Append warning to the result text — the final chunk was already sent,
+        # so we send the warning as a follow-up message.
+        warning = (
+            "\n\n⚠️ *Heads up: no data was actually saved in this response. "
+            "Ask me to try again if something was supposed to be stored.*"
+        )
+        await msg.reply_text(warning)
         result = result.__class__(
-            text=result.text + (
-                "\n\n⚠️ *Heads up: no data was actually saved in this response. "
-                "Ask me to try again if something was supposed to be stored.*"
-            ),
+            text=result.text + warning,
             invocations=result.invocations,
         )
 
     audit.log_event(
         "assistant_reply",
         user_id=user_id,
-        agent=routed_agent,
+        agent=routed_agent if routed_agent != "none" else "general",
         text=result.text,
         num_invocations=len(result.invocations),
         staged_action_ids=staged_ids,
     )
 
-    out_text = _assemble_reply(result)
-    await msg.reply_text(out_text)
+    # All content was already sent via _on_chunk. Only the staged-action
+    # footer needs to go out now (if any actions are pending confirmation).
+    staged_footer = format_staged_footer(result.invocations)
+    if staged_footer:
+        await msg.reply_text(staged_footer)
+
+    # Fire weekly summary check in the background — after the user's reply
+    # is already sent so it never adds latency to the conversation.
+    async def _send(text: str) -> None:
+        await msg.reply_text(text)
+
+    asyncio.create_task(_check_weekly_summaries(user_id, _send))
 
 
 # Telegram's hard cap is 4096 UTF-16 code units (not bytes). We use 4000 to
@@ -452,13 +524,28 @@ def _assemble_reply(result) -> str:
 
     The footer is the structural safety net — if the LLM forgets to mention
     /confirm, the user still sees the staged action_id with its preview.
+
+    NOTE: This function is NOT used in the live streaming path (handle_msg).
+    Streaming delivers each turn immediately via _on_chunk. This function
+    exists as a reference implementation and for any non-streaming callers
+    that may be added in future.
     """
     sections: list[str] = []
 
     if SHOW_TOOL_CALLS and result.invocations:
         sections.append(format_debug_header(result.invocations))
 
+    # Prepend any text the LLM emitted alongside tool-call turns.
+    # These are mid-loop thoughts/explanations that would otherwise be silently
+    # dropped (e.g. "I need to be honest: I didn't log anything — let me fix that").
+    for interim in result.interim_texts:
+        sections.append(interim)
+
     sections.append(result.text or "")
+
+    write_conf = format_write_confirmation(result.invocations)
+    if write_conf:
+        sections.append(write_conf)
 
     footer = format_staged_footer(result.invocations)
     if footer:
@@ -534,6 +621,10 @@ def main() -> None:
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
     app.add_error_handler(_telegram_error_handler)
+
+    # Reminder scheduler — checks every 60 seconds for due reminders.
+    app.job_queue.run_repeating(check_due_reminders, interval=60, first=10)
+    log.info("Reminder scheduler started (60s interval)")
 
     log.info("Starting long-polling loop")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
