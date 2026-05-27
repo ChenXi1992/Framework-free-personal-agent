@@ -2,7 +2,6 @@
 
 A personal Telegram-fronted AI assistant. Reads Gmail, Notion, Google Calendar, and local files. Routes messages to specialist agents (workout, lifestyle, growth, career, dutch) and remembers your history. Hand-rolled agent loop on top of DeepSeek's OpenAI-compatible API — no LangChain, no LlamaIndex, no framework.
 
-Designed to run on a local NAS or home server.
 
 The final goal is to build a personal assistant that stores all the information about my daily life (work, hobbies, lifestyle), and ultimately makes decisions, provides feedback, and automates certain tasks for me.
 
@@ -16,6 +15,7 @@ The final goal is to build a personal assistant that stores all the information 
 - Weekly summaries auto-generated per agent when a new week begins
 
 **Next:**
+- Agent reflection on prompts
 - Deploy via FastAPI (multi-access channel)
 - Proactive reminders and scheduled agent check-ins
 - Fine-tune routing accuracy for edge cases
