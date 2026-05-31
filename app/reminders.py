@@ -97,10 +97,12 @@ def _get_today_conversations(agent: str) -> list[dict]:
 # LLM calls
 # ---------------------------------------------------------------------------
 
+_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+
+
 def _llm(system: str, user: str, max_tokens: int = 200) -> str:
-    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
     try:
-        resp = client.chat.completions.create(
+        resp = _client.chat.completions.create(
             model=DEEPSEEK_MODEL,
             messages=[
                 {"role": "system", "content": system},

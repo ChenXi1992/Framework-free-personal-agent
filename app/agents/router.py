@@ -305,12 +305,19 @@ def agent_message_history(agent: str, limit: int = 20) -> list[dict[str, str]]:
 # Store agent turn
 # ---------------------------------------------------------------------------
 
-def store_turn(agent: str, role: str, content: str) -> None:
-    """Append one turn (user or assistant) to the agent's conversation history."""
+def store_turn(agent: str, role: str, content: str, msg_type: str = "chat") -> None:
+    """Append one turn (user or assistant) to the agent's conversation history.
+
+    `msg_type` is stored so the sticky-agent fallback can detect grill sessions
+    and skip the word-count limit for follow-up answers (which can be long).
+    Defaults to 'chat' for all non-grill turns; existing rows default to 'chat'
+    via the DB migration so the column is backwards-compatible.
+    """
     with db._connect() as conn:
         conn.execute(
-            "INSERT INTO agent_conversations(ts, created_at, agent, role, content) VALUES (?,?,?,?,?)",
-            (int(time.time()), _utc_now(), agent, role, content),
+            "INSERT INTO agent_conversations(ts, created_at, agent, role, content, msg_type) "
+            "VALUES (?,?,?,?,?,?)",
+            (int(time.time()), _utc_now(), agent, role, content, msg_type),
         )
 
 

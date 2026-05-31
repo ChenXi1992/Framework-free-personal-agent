@@ -138,32 +138,6 @@ def notes_search(query: str, category: str = "all", limit: int = 10) -> dict[str
 
 @tool(
     description=(
-        "Log one turn of an agent conversation for memory. "
-        "Call after every user message and agent reply."
-    ),
-    parameters={
-        "type": "object",
-        "properties": {
-            "agent":   {"type": "string"},  # injected server-side — hidden from LLM
-            "role":    {"type": "string", "enum": ["user", "assistant"]},
-            "content": {"type": "string"},
-        },
-        "required": ["agent", "role", "content"],
-    },
-    agent_scoped=True,
-)
-def conversation_add(agent: str, role: str, content: str) -> dict[str, Any]:
-    """Persist one conversation turn for a specific agent."""
-    with _connect() as conn:
-        cur = conn.execute(
-            "INSERT INTO agent_conversations(ts, created_at, agent, role, content) VALUES (?,?,?,?,?)",
-            (int(time.time()), _utc_now(), agent, role, content),
-        )
-    return {"ok": True, "id": cur.lastrowid}
-
-
-@tool(
-    description=(
         "Retrieve recent conversation history for this agent. "
         "Returns turns in chronological order (oldest first)."
     ),

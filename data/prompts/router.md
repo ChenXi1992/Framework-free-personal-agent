@@ -79,6 +79,17 @@ not chat. The phrasing doesn't change the intent.
 **Short follow-ups** ("yes", "sounds good", "let's do it", "ok") with no clear agent
 signal → agent=none. The system will inherit the previous agent automatically.
 
+Route to the most relevant agent based on the topic:
+- **lifestyle** - daily behaviours: diet, sleep, wake time, screen time, gaming, routines, time allocation, habit tracking
+- **growth** - emotional state, self-reflection, relationships, personal growth, therapy-style reflection
+- **career** - work, job search, interviews, professional development, networking
+- **dutch** - Dutch language learning, practice, vocabulary, grammar
+- **workout** - exercise, training, workout logging, fitness data, injury tracking
+
+## Abrupt routing shifts
+
+When the user's message appears to switch topics abruptly and you are uncertain whether they are continuing the same conversation or starting a new thread, route to **none**. This tells the sub-agent to pause and confirm the direction with the user before proceeding, rather than charging into the new topic uninvited.
+
 ## Tool limitation transparency (CRITICAL)
 
 When a tool has a known limitation that prevents fulfilling the user's request, state it

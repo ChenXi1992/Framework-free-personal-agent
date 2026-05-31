@@ -45,6 +45,11 @@ DB_PATH: str = os.environ.get("DB_PATH", "me.db")
 # Tavily web search API key (https://app.tavily.com).
 # Leave blank to disable the web_search tool — the bot starts fine without it.
 TAVILY_API_KEY: str = os.environ.get("TAVILY_API_KEY", "")
+
+# Local faster-whisper HTTP server for voice-to-text transcription.
+# Set to "" to disable voice message handling.
+WHISPER_API_URL: str = os.environ.get("WHISPER_API_URL", "http://localhost:8000")
+WHISPER_API_KEY: str = os.environ.get("WHISPER_API_KEY", "")
 LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 # Model: deepseek-chat (V3, fast/cheap) or deepseek-reasoner (R1, slower/smarter).
@@ -82,6 +87,11 @@ CONVERSATION_SUMMARY_THRESHOLD: int = int(
 # Default agent for diary entries when the router returns agent=none.
 # Override if you've replaced or renamed the growth agent.
 DIARY_DEFAULT_AGENT: str = os.environ.get("DIARY_DEFAULT_AGENT", "growth")
+
+# Default agent for grill sessions when the router returns agent=none
+# (e.g. bare "grill me" with no domain specified).
+# Growth is the most natural default for open-ended self-challenge.
+GRILL_DEFAULT_AGENT: str = os.environ.get("GRILL_DEFAULT_AGENT", "growth")
 
 # Timezone for week boundary calculations (weekly summaries).
 # Weekly summaries are generated on Monday 00:00 in this timezone.

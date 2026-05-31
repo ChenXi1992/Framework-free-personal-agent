@@ -8,6 +8,7 @@ full pipeline from raw text to ChatResult:
      - "note"  → store to DB immediately; agent responds without note_add tool
      - "diary" → agent handles everything (diary_add + note_add + response)
      - "chat"  → normal conversation with the matched specialist agent
+     - "grill" → agent switches to examiner mode (one question at a time, feedback, weak-spot notes)
      - agent == "none" → general LLM with no specialist persona
 
   2. Sticky-agent fallback
@@ -37,7 +38,7 @@ from pathlib import Path
 from typing import Callable
 
 from .. import audit, db, debug_log
-from ..config import DEBUG_LOG_AGENT_PROMPT, DIARY_DEFAULT_AGENT
+from ..config import DEBUG_LOG_AGENT_PROMPT, DIARY_DEFAULT_AGENT, GRILL_DEFAULT_AGENT
 from ..db import _utc_now
 from ..llm import ChatResult, ToolInvocation, chat
 from . import router as _router
@@ -105,27 +106,31 @@ def _build_general_prompt() -> str:
 _STICKY_MAX_AGE_SECONDS = 3600  # 1 hour
 
 
-def _last_used_agent() -> str | None:
-    """Return the name of the most recently active specialist agent, or None.
+def _last_used_agent() -> tuple[str | None, str]:
+    """Return (agent_name, msg_type) for the most recently active conversation.
 
-    Used to provide routing context for short, ambiguous follow-up messages
-    (e.g. "Yes", "Sounds good", "Let's do it") that carry no agent signal on
-    their own — the router needs to know what we were just talking about.
+    Returns (None, 'chat') when no recent conversation exists or the last one
+    is older than _STICKY_MAX_AGE_SECONDS (1 hour).
 
-    Only returns an agent if a conversation happened within _STICKY_MAX_AGE_SECONDS
-    (1 hour). Stale agent context from hours ago should not silently hijack a new
-    unrelated conversation.
+    `msg_type` is used by the sticky fallback to detect ongoing grill sessions:
+    grill answers can be long, so the normal 5-word limit must be bypassed for
+    the duration of the session.
     """
     with db._connect() as conn:
+        # Exclude "general" — it is a pass-through, not a specialist, so it
+        # must not block a real specialist from being inherited. Without this,
+        # a general exchange between two specialist turns would reset the sticky
+        # context and lose the specialist chain.
         row = conn.execute(
-            "SELECT agent, ts FROM agent_conversations ORDER BY ts DESC LIMIT 1"
+            "SELECT agent, ts, msg_type FROM agent_conversations "
+            "WHERE agent != 'general' ORDER BY ts DESC LIMIT 1"
         ).fetchone()
     if not row:
-        return None
-    agent, ts = row
+        return None, "chat"
+    agent, ts, msg_type = row
     if (time.time() - ts) > _STICKY_MAX_AGE_SECONDS:
-        return None
-    return agent
+        return None, "chat"
+    return agent, (msg_type or "chat")
 
 
 def handle(
@@ -147,7 +152,7 @@ def handle(
          is ≤ 5 words AND there is a recent agent conversation, inherit that agent.
          This handles bare acknowledgements like "confirm" or "go ahead".
     """
-    last_agent = _last_used_agent()
+    last_agent, last_msg_type = _last_used_agent()
     context_hint = (
         f"The previous conversation was with the {last_agent} agent."
         if last_agent else ""
@@ -159,16 +164,22 @@ def handle(
 
     # Sticky-agent fallback: short ambiguous messages (≤ _STICKY_WORD_LIMIT words)
     # that the router can't classify (e.g. "Yes", "OK", "Let's do it") are
-    # inherited by the last active agent. 5 is the empirical boundary below which
-    # a message rarely has enough signal to route independently.
+    # inherited by the last active agent.
+    #
+    # Grill exception: during an active grill session answers can be long
+    # ("I think the verb moves to the end because it's a subordinate clause").
+    # When the last stored turn was grill we skip the word-count check entirely
+    # so every answer — regardless of length — stays with the correct specialist.
     sticky_fired = False
-    if agent == "none" and last_agent and len(user_message.split()) <= _STICKY_WORD_LIMIT:
-        log.debug(
-            "Sticky agent fallback: short message '%s' → continuing %s agent",
-            user_message, last_agent,
-        )
-        agent = last_agent
-        sticky_fired = True
+    if agent == "none" and last_agent:
+        is_grill_followup = last_msg_type == "grill"
+        if is_grill_followup or len(user_message.split()) <= _STICKY_WORD_LIMIT:
+            log.debug(
+                "Sticky agent fallback: '%s' → continuing %s agent (grill_followup=%s)",
+                user_message, last_agent, is_grill_followup,
+            )
+            agent = last_agent
+            sticky_fired = True
 
     log.debug("Route: type=%s agent=%s category=%s", msg_type, agent, category)
 
@@ -226,11 +237,27 @@ def handle(
             agent = DIARY_DEFAULT_AGENT
             log.debug("Diary entry with no specific agent — defaulting to %s agent", agent)
 
+    # --- Grill intake ---
+    # "Grill me" messages switch the agent from assistant → examiner mode.
+    # The agent uses its domain notes + goals to generate targeted challenge questions,
+    # gives feedback on each answer, and tracks weak spots via note_add.
+    # When no specific agent is identified, fall back to GRILL_DEFAULT_AGENT (growth)
+    # since "grill me" with no context is most naturally a self-improvement challenge.
+    if msg_type == "grill":
+        if agent == "none":
+            agent = GRILL_DEFAULT_AGENT
+            log.debug("Grill with no specific agent — defaulting to %s agent", agent)
+
     # --- General (no specific agent) ---
     if agent == "none":
         result = chat(global_history, user_id=user_id,
                       system_prompt=_build_general_prompt(), agent="general",
                       on_chunk=on_chunk)
+        # Persist the general conversation so conversation_recent(agent="general")
+        # can retrieve it. Specialist agents store their turns at the bottom of
+        # this function — the general path was missing these calls entirely.
+        _router.store_turn("general", "user", user_message, "chat")
+        _router.store_turn("general", "assistant", result.text, "chat")
         return result, "none"
 
     # --- Agent-specific ---
@@ -259,6 +286,25 @@ def handle(
             "4. Then respond naturally.]\n\n"
             + user_message
         )
+    elif msg_type == "grill":
+        # Switch the agent into examiner mode. The agent's existing context block
+        # (notes + goals) already contains the domain knowledge to draw from.
+        # The instructions are injected as a user-turn prefix so the agent sees
+        # them as an explicit directive, not background system context.
+        content_for_agent = (
+            "[GRILL MODE — you are now an examiner, not an assistant. Rules:\n"
+            "1. Review your notes and goals context to identify areas to probe.\n"
+            "2. Ask ONE focused, challenging question to start. Do not ask multiple at once.\n"
+            "3. After the user answers: give direct feedback — what they got right, "
+            "what is missing or wrong, and why it matters.\n"
+            "4. Call note_add(category=<your domain>, summary='Grill: weak on <topic>') "
+            "for any significant knowledge gap or repeated mistake, so future sessions "
+            "can target those weak spots.\n"
+            "5. Then ask the next question. Continue until the user signals they want to stop.\n"
+            "6. Be tough but constructive — this is deliberate practice, not a lecture.\n"
+            "Start now with your first question.]\n\n"
+            + user_message
+        )
     else:
         # type == "note": note already stored by dispatch; note_add excluded below.
         # type == "chat": plain conversation, no special wrapping needed.
@@ -275,9 +321,19 @@ def handle(
                   system_prompt=persona_prompt, agent=agent,
                   exclude_tools=excluded, on_chunk=on_chunk)
 
+    # Determine what type to record for this turn.
+    # Grill type propagates forward through the session: even though the router
+    # classifies follow-up answers as "chat", we keep storing "grill" so the
+    # next call's sticky fallback still skips the word-count limit.
+    # The session naturally exits when the user switches agent or the 1-hour
+    # sticky window expires — no explicit "stop grill" bookkeeping needed.
+    store_type = msg_type
+    if msg_type == "chat" and last_msg_type == "grill" and agent == last_agent:
+        store_type = "grill"
+
     # Persist this turn in agent conversation memory
-    _router.store_turn(agent, "user", user_message)
-    _router.store_turn(agent, "assistant", result.text)
+    _router.store_turn(agent, "user", user_message, store_type)
+    _router.store_turn(agent, "assistant", result.text, store_type)
 
     # If summarisation fired this turn, notify the user.
     # When on_chunk is active all content goes through that channel — we send

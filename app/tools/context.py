@@ -38,7 +38,7 @@ def _available() -> list[str]:
     can pass them directly to context_load().
     """
     return sorted(
-        str(p.relative_to(_DATA_DIR))
+        p.relative_to(_DATA_DIR).as_posix()   # always forward slashes, even on Windows
         for p in _DATA_DIR.rglob("*.md")
         if p.name not in _EXCLUDED and p.is_file()
     )

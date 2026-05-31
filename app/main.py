@@ -27,6 +27,7 @@ Commands
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
@@ -34,7 +35,10 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
+
 from telegram import Update
+from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -44,7 +48,7 @@ from telegram.ext import (
 )
 
 from . import audit
-from .config import AGENT_TEMPERATURE, ALLOWED_USERS, DEEPSEEK_MODEL, HISTORY_TURNS, LOG_LEVEL, MAX_TOOL_TURNS, TELEGRAM_BOT_TOKEN
+from .config import AGENT_TEMPERATURE, ALLOWED_USERS, DEEPSEEK_MODEL, HISTORY_TURNS, LOG_LEVEL, MAX_TOOL_TURNS, TELEGRAM_BOT_TOKEN, WHISPER_API_KEY, WHISPER_API_URL
 from .db import init as db_init, log_message, recent_history
 from .llm import format_debug_header, format_staged_footer, format_write_confirmation
 from .tools import pending  # ensures pending table is created
@@ -395,6 +399,20 @@ async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await msg.reply_text("Nothing to cancel — no pending action found.")
         return
 
+    await _run_agent_pipeline(update, msg, text, user_id)
+
+
+async def _run_agent_pipeline(
+    update: Update,
+    msg,
+    text: str,
+    user_id: int,
+) -> None:
+    """Core agent loop shared by text and voice handlers.
+
+    Logs the user message, fetches history, runs the agent, streams chunks
+    back to Telegram, and fires the weekly-summary background task.
+    """
     log_message(user_id, "user", text)
     audit.log_event("user_message", user_id=user_id, text=text)
 
@@ -512,6 +530,70 @@ async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     asyncio.create_task(_check_weekly_summaries(user_id, _send))
 
 
+# ---------------------------------------------------------------------------
+# Voice handler (speech-to-text via local faster-whisper server)
+# ---------------------------------------------------------------------------
+
+async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Transcribe a Telegram voice message and route it through the agent pipeline.
+
+    Flow:
+      1. Download the .ogg voice file Telegram sends.
+      2. POST it to the local faster-whisper HTTP server.
+      3. Echo the transcript back so the user can verify what was heard.
+      4. Feed the transcript into the same agent pipeline as a typed message.
+    """
+    msg = update.message
+    if msg is None:
+        return
+    if not _allowed(update):
+        await msg.reply_text("Not authorized.")
+        return
+
+    if not WHISPER_API_URL:
+        await msg.reply_text("⚠️ Voice messages are disabled (WHISPER_API_URL not set).")
+        return
+
+    # Show a "typing…" indicator while we transcribe.
+    await ctx.bot.send_chat_action(chat_id=msg.chat_id, action=ChatAction.TYPING)
+
+    # Download the voice file into memory.
+    tg_file = await msg.voice.get_file()
+    buf = io.BytesIO()
+    await tg_file.download_to_memory(buf)
+    buf.seek(0)
+
+    # Transcribe via the local faster-whisper server.
+    try:
+        headers = {"X-API-Key": WHISPER_API_KEY} if WHISPER_API_KEY else {}
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{WHISPER_API_URL}/v1/audio/transcriptions",
+                files={"file": ("voice.ogg", buf, "audio/ogg")},
+                data={"model": "whisper-1"},
+                headers=headers,
+                timeout=60.0,
+            )
+            resp.raise_for_status()
+            text = resp.json().get("text", "").strip()
+    except Exception as exc:
+        log.error("Whisper transcription failed: %s", exc)
+        await msg.reply_text("⚠️ Voice transcription failed — please try again or type your message.")
+        return
+
+    if not text:
+        await msg.reply_text("⚠️ Couldn't transcribe the voice message — got an empty result.")
+        return
+
+    log.info("Voice transcribed (user=%s, chars=%d): %s", update.effective_user.id, len(text), text[:120])
+
+    # Echo the transcript so the user can confirm what was understood.
+    await msg.reply_text(f"🎙️ _{text}_", parse_mode="Markdown")
+
+    # Run through the same agent pipeline as a typed message.
+    await _run_agent_pipeline(update, msg, text, update.effective_user.id)
+
+
 # Telegram's hard cap is 4096 UTF-16 code units (not bytes). We use 4000 to
 # leave ~96 chars of headroom for the "———" dividers and the staged-action
 # footer that _assemble_reply() appends after measuring the LLM text.
@@ -620,6 +702,7 @@ def main() -> None:
     app.add_handler(CommandHandler("confirm", cmd_confirm))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_msg))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_error_handler(_telegram_error_handler)
 
     # Reminder scheduler — checks every 60 seconds for due reminders.

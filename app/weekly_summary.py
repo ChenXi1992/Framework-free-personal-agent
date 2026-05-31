@@ -24,6 +24,8 @@ from . import audit
 from .config import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, TIMEZONE
 from .db import _connect, _utc_now
 
+_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
+
 log = logging.getLogger(__name__)
 
 _DATA_DIR = Path(__file__).parent.parent / "data"
@@ -214,9 +216,8 @@ def _generate_summary(agent: str, year: int, week: int, notes: list[dict]) -> st
 
     user = f"Generate the weekly summary for the notes below:\n\n{notes_block}"
 
-    client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
     try:
-        resp = client.chat.completions.create(
+        resp = _client.chat.completions.create(
             model=DEEPSEEK_MODEL,
             messages=[
                 {"role": "system", "content": system},

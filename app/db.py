@@ -168,6 +168,7 @@ _MIGRATIONS = [
     ("messages",            "created_at  TEXT NOT NULL DEFAULT '1970-01-01 00:00:00'"),
     ("notes",               "created_at  TEXT NOT NULL DEFAULT '1970-01-01 00:00:00'"),
     ("agent_conversations", "created_at  TEXT NOT NULL DEFAULT '1970-01-01 00:00:00'"),
+    ("agent_conversations", "msg_type    TEXT NOT NULL DEFAULT 'chat'"),
     ("feedback",            "created_at  TEXT NOT NULL DEFAULT '1970-01-01 00:00:00'"),
     ("health_daily",        "date_iso    TEXT"),
     ("sport_daily",         "date_iso    TEXT"),
