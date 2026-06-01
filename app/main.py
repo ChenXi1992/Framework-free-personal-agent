@@ -48,8 +48,9 @@ from telegram.ext import (
 )
 
 from . import audit
-from .config import AGENT_TEMPERATURE, ALLOWED_USERS, DEEPSEEK_MODEL, HISTORY_TURNS, LOG_LEVEL, MAX_TOOL_TURNS, TELEGRAM_BOT_TOKEN, WHISPER_API_KEY, WHISPER_API_URL
-from .db import init as db_init, log_message, recent_history
+from .config import AGENT_TEMPERATURE, ALLOWED_USERS, DEEPSEEK_MODEL, HISTORY_TURNS, LOG_LEVEL, MAX_TOOL_TURNS, TELEGRAM_BOT_TOKEN, WHISPER_API_KEY, WHISPER_API_URL, SHOW_TOOL_CALLS, SHOW_REASONING, REASONING_MAX_CHARS
+from .db import init as db_init, log_message, recent_history, tag_last_exchange, tag_message
+from .db import _connect as _db_connect
 from .llm import format_debug_header, format_staged_footer, format_write_confirmation
 from .tools import pending  # ensures pending table is created
 from .agents.dispatch import handle as agent_handle
@@ -176,11 +177,11 @@ calendar_tools  = _safe_import("calendar")
 file_tools      = _safe_import("files")
 prompt_tools    = _safe_import("prompts")
 reminder_tools  = _safe_import("reminders")
+todo_tools      = _safe_import("todo")
+diary_tools     = _safe_import("diary")
 
-# Show every tool invocation as a header line on each Telegram reply when
-# logging is at DEBUG level. Off in INFO/WARNING because it's chatty for
-# day-to-day use. Toggle by setting LOG_LEVEL=DEBUG in .env and restarting.
-SHOW_TOOL_CALLS = LOG_LEVEL == "DEBUG"
+# SHOW_TOOL_CALLS and SHOW_REASONING are imported from config above.
+# Enable them independently in .env without switching to LOG_LEVEL=DEBUG.
 
 
 # Maps tool_name → the module-level execute_confirmed() that knows how to
@@ -196,7 +197,8 @@ if notion_tools:
     EXECUTORS["notion_create_page"]      = notion_tools.execute_confirmed
     EXECUTORS["notion_archive_page"]     = notion_tools.execute_confirmed
 if gmail_tools:
-    EXECUTORS["gmail_send_message"] = gmail_tools.execute_confirmed
+    EXECUTORS["gmail_send_message"]  = gmail_tools.execute_confirmed
+    EXECUTORS["gmail_trash_message"] = gmail_tools.execute_confirmed
 if calendar_tools:
     EXECUTORS["calendar_create_event"] = calendar_tools.execute_confirmed
     EXECUTORS["calendar_delete_event"] = calendar_tools.execute_confirmed
@@ -205,9 +207,16 @@ if file_tools:
     EXECUTORS["file_edit"] = file_tools.execute_confirmed
     EXECUTORS["file_append"] = file_tools.execute_confirmed
 if prompt_tools:
-    EXECUTORS["prompt_propose"] = prompt_tools.execute_confirmed
+    EXECUTORS["prompt_replace_section"] = prompt_tools.execute_confirmed
+    EXECUTORS["prompt_add_section"]     = prompt_tools.execute_confirmed
 if reminder_tools:
     EXECUTORS["reminder_set"] = reminder_tools.execute_confirmed
+if todo_tools:
+    EXECUTORS["todo_add"]    = todo_tools.execute_confirmed
+    EXECUTORS["todo_done"]   = todo_tools.execute_confirmed
+    EXECUTORS["todo_delete"] = todo_tools.execute_confirmed
+if diary_tools:
+    EXECUTORS["diary_add"] = diary_tools.execute_confirmed
 
 
 # ---------------------------------------------------------------------------
@@ -252,20 +261,72 @@ async def cmd_start(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_reset(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /reset — insert a sentinel message so _trim_after_reset drops prior history."""
+    """Handle /reset — clear conversation memory for general AND all specialists.
+
+    Writes a sentinel that history/summarisation reads filter on (so every agent
+    gets a clean slate, not just general), and clears the stored per-agent
+    summaries so pre-reset context can't leak back in via the persona block.
+    """
     if not _allowed(update):
         return
     log_message(update.effective_user.id, "system", "--- conversation reset ---")
-    await update.message.reply_text("Memory cleared for this conversation.")
+    with _db_connect() as conn:
+        conn.execute("DELETE FROM conversation_summaries")
+    await update.message.reply_text("Memory cleared — general and all specialist agents.")
+
+
+def _execute_pending(action: dict, user_id: int) -> tuple[bool, str]:
+    """Claim + run one pending action. Returns (ok, human_message).
+
+    Atomic claim prevents double execution; executor errors are caught; on
+    success a [CONFIRMED] note is logged to the staging agent's history.
+    Safe to call in a loop for batch confirmation.
+    """
+    action_id = action["id"]
+    executor = EXECUTORS.get(action["tool_name"])
+    if executor is None:
+        return False, f"{action_id}: no executor for {action['tool_name']} (bug)."
+
+    # Atomically claim (pending → confirmed); a concurrent confirm loses the race.
+    if not pending.claim(action_id):
+        return False, f"{action_id}: already handled."
+
+    try:
+        exec_result = executor(action["tool_name"], action["arguments"])
+    except Exception as e:  # noqa: BLE001
+        log.exception("Executor raised for %s", action["tool_name"])
+        exec_result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    audit.log_event(
+        "confirm", user_id=user_id, action_id=action_id,
+        tool=action["tool_name"], arguments=action["arguments"],
+        ok=bool(exec_result.get("ok")), result=exec_result,
+    )
+
+    if exec_result.get("ok"):
+        pending.mark(action_id, "executed", str(exec_result))
+        # Tell the staging agent its action was applied (covers 'general').
+        staging_agent = action.get("agent") or "general"
+        _msg_id = log_message(user_id, "system", f"[CONFIRMED] {action['preview'][:300]}")
+        tag_message(_msg_id, staging_agent)  # tag only this note
+        return True, f"✅ {action['preview']}"
+    else:
+        pending.mark(action_id, "failed", str(exec_result))
+        return False, f"❌ {action['preview']}\n   → {exec_result.get('error', 'unknown error')}"
 
 
 async def cmd_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /confirm [id] — execute the specified (or most recent) pending action."""
+    """Handle /confirm [id].
+
+    With an id  → execute just that action.
+    With no id  → execute ALL pending actions in one go (batch confirm), so a
+                  set of related stages (e.g. 4 calendar events) needs one confirm.
+    """
     if not _allowed(update):
         return
     user_id = update.effective_user.id
 
-    # /confirm with no arg -> default to the latest still-pending action.
+    # --- Targeted: /confirm <id> → that one action only ---
     if ctx.args:
         action_id = ctx.args[0]
         action = pending.get(action_id)
@@ -275,45 +336,34 @@ async def cmd_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if action["user_id"] != user_id:
             await update.message.reply_text("That action belongs to a different user.")
             return
-    else:
-        action = pending.latest_pending_for(user_id)
-        if action is None:
-            await update.message.reply_text("No pending actions to confirm.")
+        if action["status"] != "pending":
+            await update.message.reply_text(
+                f"Action {action_id} is already {action['status']}."
+            )
             return
-        action_id = action["id"]
-
-    if action["status"] != "pending":
-        await update.message.reply_text(
-            f"Action {action_id} is already {action['status']}."
-        )
+        _ok, msg = _execute_pending(action, user_id)
+        await update.message.reply_text(msg)
         return
 
-    executor = EXECUTORS.get(action["tool_name"])
-    if executor is None:
-        await update.message.reply_text(
-            f"No executor registered for {action['tool_name']}. "
-            "This is a bug — please report."
-        )
+    # --- Bare confirm → execute the whole pending batch ---
+    actions = pending.all_pending_for(user_id)
+    if not actions:
+        await update.message.reply_text("No pending actions to confirm.")
         return
 
-    exec_result = executor(action["tool_name"], action["arguments"])
-    audit.log_event(
-        "confirm",
-        user_id=update.effective_user.id,
-        action_id=action_id,
-        tool=action["tool_name"],
-        arguments=action["arguments"],
-        ok=bool(exec_result.get("ok")),
-        result=exec_result,
-    )
-    if exec_result.get("ok"):
-        pending.mark(action_id, "executed", str(exec_result))
-        await update.message.reply_text(f"Done. {action['preview']}")
-    else:
-        pending.mark(action_id, "failed", str(exec_result))
-        await update.message.reply_text(
-            f"Failed: {exec_result.get('error', 'unknown error')}"
-        )
+    if len(actions) == 1:
+        _ok, msg = _execute_pending(actions[0], user_id)
+        await update.message.reply_text(msg)
+        return
+
+    results = [_execute_pending(a, user_id) for a in actions]
+    n_ok = sum(1 for ok, _ in results if ok)
+    n_fail = len(results) - n_ok
+    header = f"Confirmed {n_ok}/{len(results)} actions" + (
+        f" — {n_fail} failed" if n_fail else ""
+    ) + ":"
+    body = "\n".join(m for _, m in results)
+    await update.message.reply_text(f"{header}\n\n{body}")
 
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -413,7 +463,7 @@ async def _run_agent_pipeline(
     Logs the user message, fetches history, runs the agent, streams chunks
     back to Telegram, and fires the weekly-summary background task.
     """
-    log_message(user_id, "user", text)
+    log_message(user_id, "user", text)   # agent tagged below after routing is known
     audit.log_event("user_message", user_id=user_id, text=text)
 
     history = _trim_after_reset(recent_history(user_id, limit=HISTORY_TURNS))
@@ -424,17 +474,36 @@ async def _run_agent_pipeline(
     # bridges back to the async event loop so we can call reply_text() safely.
     _event_loop = asyncio.get_running_loop()
 
-    def _on_chunk(turn_invocations, chunk_text: str) -> None:
+    def _on_chunk(turn_invocations, chunk_text: str, reasoning: str = "") -> None:
         sections: list[str] = []
+
+        # Reasoning block — shown first so the user sees the thinking before
+        # the tool calls and final answer.  Truncated to REASONING_MAX_CHARS
+        # so it never swamps the message.  Markdown italic wrapping.
+        if SHOW_REASONING and reasoning:
+            preview = reasoning[:REASONING_MAX_CHARS]
+            if len(reasoning) > REASONING_MAX_CHARS:
+                preview += "…"
+            # Escape underscores so Markdown doesn't break mid-word italics
+            preview = preview.replace("_", "\\_")
+            sections.append(f"💭 _{preview}_")
+
+        # Tool calls header — shown when SHOW_TOOL_CALLS=true in .env.
         if SHOW_TOOL_CALLS and turn_invocations:
             sections.append(format_debug_header(turn_invocations))
-        # Always show note/diary/todo write confirmations so the user has
-        # ground-truth proof the tool actually ran — independent of LOG_LEVEL.
-        write_conf = format_write_confirmation(turn_invocations)
-        if write_conf:
-            sections.append(write_conf)
+        else:
+            # When SHOW_TOOL_CALLS is off, still surface write confirmations
+            # (note_add, diary_add, todo_add, agent_handoff) so the user has
+            # ground-truth proof data was saved — independent of the debug flag.
+            # Skipped when SHOW_TOOL_CALLS is on because the full header already
+            # covers these tools, and showing them twice is just noise.
+            write_conf = format_write_confirmation(turn_invocations)
+            if write_conf:
+                sections.append(write_conf)
+
         if chunk_text:
             sections.append(chunk_text)
+
         if not sections:
             return
         out = "\n———\n".join(sections)
@@ -455,9 +524,11 @@ async def _run_agent_pipeline(
         lambda: agent_handle(text, user_id=user_id, global_history=history, on_chunk=_on_chunk),
     )
 
-    # Persist only the assistant's natural-language text. The invocation list
-    # is fully captured in audit.log_event("tool_call", ...) per turn.
+    # Persist the assistant response, then tag both this turn and the preceding
+    # user turn with the routing agent — single write, no separate agent_conversations.
     log_message(user_id, "assistant", result.text)
+    agent_tag = routed_agent if routed_agent != "none" else "general"
+    tag_last_exchange(user_id, agent_tag)
     staged_ids = [
         i.result.get("action_id")
         for i in result.invocations
@@ -618,16 +689,17 @@ def _assemble_reply(result) -> str:
         sections.append(format_debug_header(result.invocations))
 
     # Prepend any text the LLM emitted alongside tool-call turns.
-    # These are mid-loop thoughts/explanations that would otherwise be silently
-    # dropped (e.g. "I need to be honest: I didn't log anything — let me fix that").
     for interim in result.interim_texts:
         sections.append(interim)
 
     sections.append(result.text or "")
 
-    write_conf = format_write_confirmation(result.invocations)
-    if write_conf:
-        sections.append(write_conf)
+    # Only show write confirmations when the full debug header is off —
+    # otherwise note_add / agent_handoff appear twice.
+    if not SHOW_TOOL_CALLS:
+        write_conf = format_write_confirmation(result.invocations)
+        if write_conf:
+            sections.append(write_conf)
 
     footer = format_staged_footer(result.invocations)
     if footer:

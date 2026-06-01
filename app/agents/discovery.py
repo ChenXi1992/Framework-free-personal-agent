@@ -29,7 +29,9 @@ log = logging.getLogger(__name__)
 
 PROMPTS_DIR = Path(__file__).parent.parent.parent / "data" / "prompts"
 
-# Files in data/prompts/ that are system prompts, NOT specialist agents
+# Files in data/prompts/ that are system prompts, NOT specialist agents.
+# Skill files (grill, notion, …) live in data/prompts/skills/ so they are
+# never scanned by get_agents() — no reserved list needed for them.
 _RESERVED = frozenset({"router"})
 
 

@@ -15,12 +15,15 @@ Health tables use the same pattern:
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Iterable
 
 from .config import DB_PATH
+
+log = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -46,16 +49,6 @@ CREATE TABLE IF NOT EXISTS notes (
 CREATE INDEX IF NOT EXISTS idx_notes_category_ts
     ON notes(category, ts);
 
-CREATE TABLE IF NOT EXISTS agent_conversations (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts          INTEGER NOT NULL,
-    created_at  TEXT    NOT NULL,          -- 'YYYY-MM-DD HH:MM:SS' UTC
-    agent       TEXT    NOT NULL,
-    role        TEXT    NOT NULL CHECK (role IN ('user','assistant')),
-    content     TEXT    NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_agent_conv_agent_ts
-    ON agent_conversations(agent, ts);
 
 CREATE TABLE IF NOT EXISTS feedback (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -166,9 +159,9 @@ CREATE TABLE IF NOT EXISTS conversation_summaries (
 # "duplicate column" error. Each entry is (table, column_definition).
 _MIGRATIONS = [
     ("messages",            "created_at  TEXT NOT NULL DEFAULT '1970-01-01 00:00:00'"),
+    ("messages",            "agent       TEXT"),          # which specialist handled this turn
     ("notes",               "created_at  TEXT NOT NULL DEFAULT '1970-01-01 00:00:00'"),
-    ("agent_conversations", "created_at  TEXT NOT NULL DEFAULT '1970-01-01 00:00:00'"),
-    ("agent_conversations", "msg_type    TEXT NOT NULL DEFAULT 'chat'"),
+
     ("feedback",            "created_at  TEXT NOT NULL DEFAULT '1970-01-01 00:00:00'"),
     ("health_daily",        "date_iso    TEXT"),
     ("sport_daily",         "date_iso    TEXT"),
@@ -205,6 +198,11 @@ def _connect() -> sqlite3.Connection:
     # handler and a background migration run simultaneously.
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
+    # busy_timeout: when another connection holds the write lock, wait up to N ms
+    # for it to free up instead of raising "database is locked" immediately. The
+    # agent loop runs in a worker thread while the event loop also writes (logging,
+    # tagging), so brief contention is normal — block-and-retry, don't fail.
+    conn.execute("PRAGMA busy_timeout=5000;")  # 5 seconds
     return conn
 
 
@@ -284,7 +282,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
             pass  # column already exists — that's fine
 
     # Step 2: repair any '1970' sentinel rows — runs every boot.
-    for table in ("messages", "notes", "agent_conversations", "feedback"):
+    for table in ("messages", "notes", "feedback"):
         conn.execute(
             f"UPDATE {table} SET created_at = datetime(ts, 'unixepoch') "
             f"WHERE created_at IS NULL OR created_at = '1970-01-01 00:00:00'"
@@ -309,6 +307,38 @@ def init() -> None:
         conn.executescript(SCHEMA)
         _migrate_notes_categories(conn)
         _migrate(conn)
+        _migrate_drop_agent_conversations(conn)
+
+
+def _migrate_drop_agent_conversations(conn: sqlite3.Connection) -> None:
+    """Retire the legacy agent_conversations table into messages, then drop it.
+
+    Older turns lived only in agent_conversations (before messages.agent existed).
+    Before dropping, copy any turn whose (role, content) isn't already in messages
+    so the agent-history queries (which now read messages only) don't lose context.
+    Idempotent: no-op once the table is gone.
+    """
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_conversations'"
+    ).fetchone()
+    if not exists:
+        return
+    # Copy orphan turns (present in agent_conversations, absent from messages) into
+    # messages with the agent tag preserved. user_id is unknown for these legacy
+    # rows, so use 0 — they are only ever read back by agent (not by user_id).
+    conn.execute(
+        """
+        INSERT INTO messages (ts, created_at, user_id, role, content, agent)
+        SELECT ac.ts, ac.created_at, 0, ac.role, ac.content, ac.agent
+        FROM agent_conversations ac
+        WHERE NOT EXISTS (
+            SELECT 1 FROM messages m
+            WHERE m.role = ac.role AND m.content = ac.content
+        )
+        """
+    )
+    conn.execute("DROP TABLE IF EXISTS agent_conversations")
+    log.info("Migrated and dropped legacy agent_conversations table")
 
 
 def log_message(
@@ -316,10 +346,10 @@ def log_message(
     role: str,
     content: str,
     meta: dict[str, Any] | None = None,
-) -> None:
-    """Append one turn to the conversation log."""
+) -> int:
+    """Append one turn to the conversation log. Returns the new row id."""
     with _connect() as conn:
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO messages(ts, created_at, user_id, role, content, meta_json) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (
@@ -330,6 +360,42 @@ def log_message(
                 content,
                 json.dumps(meta or {}),
             ),
+        )
+        return cur.lastrowid
+
+
+def tag_last_exchange(user_id: int, agent: str) -> None:
+    """Tag the most recent user+assistant pair in messages with the routing agent.
+
+    Called from main.py after dispatch completes, when the agent name is known.
+    Uses the two most-recently inserted rows for this user — which are always the
+    current exchange since the bot processes one message at a time.
+
+    All agent-history queries read from messages WHERE agent=?. This is the
+    single source of truth — the legacy agent_conversations table was removed.
+    """
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE messages SET agent = ?
+            WHERE user_id = ?
+              AND id IN (
+                  SELECT id FROM messages
+                  WHERE user_id = ?
+                  ORDER BY ts DESC LIMIT 2
+              )
+            """,
+            (agent, user_id, user_id),
+        )
+
+
+def tag_message(message_id: int, agent: str) -> None:
+    """Tag exactly one message row with an agent. Used for system notes
+    (e.g. confirmation receipts) where tagging the surrounding pair is wrong."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE messages SET agent = ? WHERE id = ?",
+            (agent, message_id),
         )
 
 

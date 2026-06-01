@@ -37,11 +37,21 @@ data/summaries/
 
 # ── Runtime logs — generated at runtime, never commit ─────────────────────────
 data/agent.log.json
+data/agent.log.jsonl
 data/agent.INFO.json
 data/agent.WARNING.json
 data/agent.ERROR.json
 data/debug.log.json
 data/tool_needs.md
+# Catch-all for any log variants (rotated, .jsonl, etc.); .example files are
+# kept because their extension is .json.example / .jsonl.example, not .json/.jsonl.
+data/*.log.json
+data/*.log.jsonl
+
+# ── Personal / work prompt context — private, do not publish ──────────────────
+data/prompts/career.md
+data/prompts/skills/notion.md
+data/prompts/.backups/
 
 # ── Raw health export — large binary / private ────────────────────────────────
 HUAWEI_HEALTH_DATA/

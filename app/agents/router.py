@@ -14,7 +14,6 @@ from __future__ import annotations
 import datetime
 import json
 import logging
-import time
 from pathlib import Path
 
 from openai import OpenAI, OpenAIError
@@ -80,14 +79,25 @@ _client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 # Prompt loading helpers
 # ---------------------------------------------------------------------------
 
-def _load_prompt(name: str) -> str:
-    """Read data/prompts/<name>.md and return its text, or '' if the file is missing.
+SKILLS_DIR = PROMPTS_DIR / "skills"
 
-    For the router prompt, replaces the {{AGENTS}} placeholder with the
-    dynamically discovered agent list so new agents are picked up automatically.
+_SKILL_FILES = {"grill", "notion"}  # files that live in prompts/skills/, not prompts/
+
+
+def _load_prompt(name: str) -> str:
+    """Read a prompt file and return its text, or '' if missing.
+
+    Agent prompts live in data/prompts/<name>.md.
+    Skill files (grill, notion, …) live in data/prompts/skills/<name>.md.
+    The router prompt has its {{AGENTS}} placeholder substituted at load time.
     """
-    p = PROMPTS_DIR / f"{name}.md"
+    if name in _SKILL_FILES:
+        p = SKILLS_DIR / f"{name}.md"
+    else:
+        p = PROMPTS_DIR / f"{name}.md"
     text = p.read_text(encoding="utf-8") if p.exists() else ""
+    if not text:
+        log.warning("Prompt file missing or empty: %s", p)
     if name == "router" and "{{AGENTS}}" in text:
         from .discovery import build_agents_block
         text = text.replace("{{AGENTS}}", build_agents_block())
@@ -109,12 +119,19 @@ _ROUTER_RETRIES     = 2     # DeepSeek occasionally returns empty or truncated o
 
 
 def _llm_json(
-    system: str, user: str, retries: int = _ROUTER_RETRIES
+    system: str, user: str, retries: int = _ROUTER_RETRIES,
+    prior_turns: list[dict] | None = None,
 ) -> tuple[dict, str, dict | None, int]:
     """Call the LLM expecting JSON output; retries on empty or unparseable responses.
 
     Uses deterministic settings (_ROUTER_TEMPERATURE=0.0) so routing
     decisions are consistent across identical inputs.
+
+    `prior_turns` is an optional list of {"role": ..., "content": ...} dicts
+    (recent conversation history) inserted between the system prompt and the
+    classification request. This gives the router enough context to resolve
+    corrections ("that's wrong"), follow-ups, and agent-switch signals that
+    are ambiguous without knowing what was just discussed.
 
     Returns (parsed_result, raw_text, usage_dict_or_None, attempt_count).
     Callers unpack only what they need; the extra fields are used by debug
@@ -127,13 +144,13 @@ def _llm_json(
     """
     last_raw = ""
     last_usage: dict | None = None
+    messages = [{"role": "system", "content": system}]
+    if prior_turns:
+        messages.extend(prior_turns)
     for attempt in range(retries + 1):
         resp = _client.chat.completions.create(
             model=DEEPSEEK_MODEL,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            messages=messages + [{"role": "user", "content": user}],
             temperature=_ROUTER_TEMPERATURE,
             max_tokens=_ROUTER_MAX_TOKENS,
         )
@@ -156,16 +173,26 @@ def _llm_json(
     raise ValueError(f"Router gave no valid JSON after {retries + 1} attempts. Last raw: {last_raw!r:.200}")
 
 
-def route(user_message: str, recent_context: str = "") -> dict[str, str]:
+def route(
+    user_message: str,
+    recent_context: str = "",
+    history: list[dict] | None = None,
+) -> dict[str, str]:
     """Classify a user message. Returns {type, agent, category, summary}.
 
-    `recent_context` is an optional hint (e.g. "The previous conversation was
-    with the workout agent.") appended to the user message so the router can
-    resolve short, ambiguous replies like "Yes" or "Sounds good" that carry no
-    agent signal on their own.
+    `history` is an optional list of recent turns (last N messages as
+    {"role": "user"/"assistant", "content": "..."} dicts). When provided,
+    they are passed to the LLM before the classification request so the
+    router can resolve corrections, follow-ups, and mid-conversation topic
+    switches that carry no agent signal on their own.
+
+    `recent_context` (legacy string hint) is still supported; it is appended
+    to the user message when no history is provided.
     """
+    # Build the classification prompt — append the legacy hint when no
+    # structured history is available (backward compat).
     prompt_text = user_message
-    if recent_context:
+    if recent_context and not history:
         prompt_text = f"{user_message}\n\n[Context: {recent_context}]"
 
     router_system = _load_prompt("router")
@@ -173,7 +200,9 @@ def route(user_message: str, recent_context: str = "") -> dict[str, str]:
     usage: dict | None = None
     attempts = 0
     try:
-        result, raw, usage, attempts = _llm_json(router_system, prompt_text)
+        result, raw, usage, attempts = _llm_json(
+            router_system, prompt_text, prior_turns=history or None
+        )
     except (OpenAIError, json.JSONDecodeError, KeyError, ValueError) as e:
         log.warning("Router failed (%s: %s), defaulting to general/none", type(e).__name__, e)
         result = {"type": "chat", "agent": "none", "category": "none"}
@@ -184,6 +213,7 @@ def route(user_message: str, recent_context: str = "") -> dict[str, str]:
         input_preview=prompt_text[:200],
         result=result,
         had_context_hint=bool(recent_context),
+        history_turns=len(history) if history else 0,
     )
 
     # Debug: full router prompt + raw LLM response + token counts.
@@ -223,6 +253,21 @@ def _build_agent_context(agent: str, category: str) -> str:
             "If you want to save a note → call note_add. "
             "If you want to write a file → call file_write or file_append. "
             "Saying 'Done!' without calling the tool is a lie — do not do it.\n\n"
+            "## Never fabricate — search first — CRITICAL\n"
+            "When Xi refers to something earlier that you cannot see in your current "
+            "context (a past statement, a number, a 'version' he wrote, a previous plan), "
+            "you MUST call notes_search / notes_recent / conversation_recent to find the "
+            "real content BEFORE responding. "
+            "Never invent Xi's past words, quotes, numbers, logs, or examples. Do not "
+            "reconstruct them from memory or 'fill in' what he probably said. "
+            "If after searching you still cannot find it, say so plainly ('I can't find "
+            "that in your history — can you paste it?') — never make it up.\n\n"
+            "## Don't act on practice/hypothetical as if real\n"
+            "If a message looks like it could be a practice sample, a hypothetical, a quote, "
+            "or part of an ongoing exercise (e.g. a storytelling draft, a 'what if') rather "
+            "than a real log or request, ask ONE clarifying question before treating it as "
+            "real. Don't convert a narrative or practice message into domain-action mode "
+            "(e.g. reading an injury into a storytelling sample).\n\n"
             "## Tool use rules\n"
             "Destructive tools (calendar_create_event, gmail_send_message, etc.) stage "
             "the action — nothing executes until the user confirms. "
@@ -233,29 +278,74 @@ def _build_agent_context(agent: str, category: str) -> str:
             "Background files about Xi (profile, goals, plans, etc.) are NOT loaded "
             "automatically. Call context_list() to see what exists, then "
             "context_load(filename) for any file relevant to the question. "
-            "Skip files that aren't needed — only load what helps you answer."
+            "Skip files that aren't needed — only load what helps you answer.\n\n"
+            "## Cross-agent handoffs\n"
+            "If you assign homework, make a plan, or take any action that another "
+            "specialist agent should know about, call agent_handoff(to_agent=..., "
+            "message=...) BEFORE replying. "
+            "Example: you (growth) assign a storytelling exercise → "
+            "agent_handoff(to_agent='workout', message='User is practising storytelling "
+            "— treat narrative writing messages as creative exercises, not real events.'). "
+            "The other agent will see your note on their very next activation.\n\n"
+            + _load_prompt("grill")
         ),
     ]
 
     # Recent notes for this agent's domain.
-    # The router returns a fine-grained `category` (e.g. "running", "sleep").
-    # If that maps to a valid notes category we use it directly; otherwise we
-    # fall back to the agent name itself (e.g. "workout") so we still get the
-    # most relevant notes even when the category is vague or unrecognised.
+    # The router can return a fine-grained category (e.g. "running", "sleep")
+    # that is not an agent name.  Notes are only stored under agent names
+    # (note_add constrains to _AGENTS; agent_handoff writes to the target
+    # agent name).  So we always need to query by the agent name — use the
+    # fine-grained category only when it happens to be a valid agent name
+    # itself, and fall back to the agent name otherwise.
     from .discovery import get_agents
-    note_category = category if category not in ("none", "uncategorized") else agent
-    if note_category in get_agents():
+    _agents = get_agents()
+    note_category = category if category in _agents else agent
+    if note_category in _agents:
         with db._connect() as conn:
             rows = conn.execute(
                 "SELECT ts, summary, raw_text FROM notes "
-                "WHERE category = ? ORDER BY ts DESC LIMIT 10",
+                "WHERE category = ? ORDER BY ts DESC LIMIT 20",
                 (note_category,),
             ).fetchall()
         if rows:
             note_lines = "\n".join(
-                f"- [{r[0]}] {r[1]}" for r in rows
+                f"- [{datetime.datetime.fromtimestamp(r[0]).strftime('%a %b %d')}] {r[1]}"
+                for r in rows
             )
             parts.append(f"## Recent {note_category} notes\n{note_lines}")
+
+    # For the workout agent: add a pre-extracted weight table so the LLM doesn't
+    # need to parse weights out of session notes. Weight is owned by the workout
+    # domain (router classifies weight → workout), so the log reads category='workout'.
+    if agent == "workout":
+        with db._connect() as conn:
+            w_rows = conn.execute(
+                "SELECT ts, raw_text, summary FROM notes "
+                "WHERE category = 'workout' "
+                "AND (raw_text LIKE '%kg%' OR summary LIKE '%kg%') "
+                "ORDER BY ts ASC",
+            ).fetchall()
+        if w_rows:
+            w_lines = "\n".join(
+                f"- [{datetime.datetime.fromtimestamp(r[0]).strftime('%b %d')}] {r[2]}"
+                for r in w_rows
+            )
+            parts.append(f"## Weight log (all entries, chronological)\n{w_lines}")
+
+    # Auto-inject Notion workspace knowledge (notion.md) for agents that handle
+    # Notion tasks. Career always uses it; general handles cross-domain Notion
+    # requests and also needs workspace IDs, page structure, and write rules.
+    # Injected here so the agent never starts blind on Notion operations —
+    # the alternative (context_load on-demand) requires the agent to know the
+    # file exists, which it can't guarantee without prior context.
+    if agent in ("career", "none"):
+        notion_path = SKILLS_DIR / "notion.md"
+        if notion_path.exists():
+            parts.append(
+                f"## Notion workspace\n"
+                f"{notion_path.read_text(encoding='utf-8').strip()}"
+            )
 
     # Auto-inject personal profile — always available so agents never start cold.
     # Silently skipped if the file doesn't exist (first-time setup / new user).
@@ -290,35 +380,53 @@ def _build_agent_context(agent: str, category: str) -> str:
 # Agent history (OpenAI message format)
 # ---------------------------------------------------------------------------
 
-def agent_message_history(agent: str, limit: int = 20) -> list[dict[str, str]]:
-    """Return the most recent `limit` agent turns as OpenAI-format messages."""
+# /reset writes a system sentinel "--- conversation reset ---". All agent history
+# and summarisation reads only consider turns AFTER the most recent reset, so a
+# reset gives every specialist a clean slate too (not just the general agent).
+# Single-user system, so the cutoff is global.
+_RESET_CUTOFF_SQL = (
+    "(SELECT COALESCE(MAX(ts), 0) FROM messages "
+    "WHERE role = 'system' AND content LIKE '%conversation reset%')"
+)
+
+
+def last_user_message(agent: str) -> str:
+    """Return the most recent user message stored for this agent, or ''."""
     with db._connect() as conn:
-        rows = conn.execute(
-            "SELECT role, content FROM agent_conversations "
-            "WHERE agent = ? ORDER BY ts DESC LIMIT ?",
-            (agent, limit),
-        ).fetchall()
-    return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+        row = conn.execute(
+            "SELECT content FROM messages "
+            "WHERE agent = ? AND role = 'user' ORDER BY ts DESC LIMIT 1",
+            (agent,),
+        ).fetchone()
+    return row[0] if row else ""
 
 
-# ---------------------------------------------------------------------------
-# Store agent turn
-# ---------------------------------------------------------------------------
+def agent_message_history(agent: str, limit: int = 20) -> list[dict[str, str]]:
+    """Return the most recent `limit` agent turns as OpenAI-format messages.
 
-def store_turn(agent: str, role: str, content: str, msg_type: str = "chat") -> None:
-    """Append one turn (user or assistant) to the agent's conversation history.
+    Reads from messages WHERE agent=?, only turns after the last /reset.
+    GROUP BY (role, content) collapses accidental duplicates; MAX(ts) orders.
 
-    `msg_type` is stored so the sticky-agent fallback can detect grill sessions
-    and skip the word-count limit for follow-up answers (which can be long).
-    Defaults to 'chat' for all non-grill turns; existing rows default to 'chat'
-    via the DB migration so the column is backwards-compatible.
+    Any non-user/assistant rows (e.g. [CONFIRMED] system notes tagged to this
+    agent) are mapped to the 'assistant' role so they don't appear as a second
+    mid-conversation 'system' message — which some models mishandle.
     """
     with db._connect() as conn:
-        conn.execute(
-            "INSERT INTO agent_conversations(ts, created_at, agent, role, content, msg_type) "
-            "VALUES (?,?,?,?,?,?)",
-            (int(time.time()), _utc_now(), agent, role, content, msg_type),
-        )
+        rows = conn.execute(
+            f"""
+            SELECT role, content
+            FROM messages
+            WHERE agent = ? AND ts > {_RESET_CUTOFF_SQL}
+            GROUP BY role, content
+            ORDER BY MAX(ts) DESC LIMIT ?
+            """,
+            (agent, limit),
+        ).fetchall()
+    return [
+        {"role": (r[0] if r[0] in ("user", "assistant") else "assistant"),
+         "content": r[1]}
+        for r in reversed(rows)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -358,7 +466,13 @@ def summarise_if_needed(agent: str) -> bool:
 
     with db._connect() as conn:
         total = conn.execute(
-            "SELECT COUNT(*) FROM agent_conversations WHERE agent = ?",
+            f"""
+            SELECT COUNT(*) FROM (
+                SELECT role, content FROM messages
+                WHERE agent = ? AND ts > {_RESET_CUTOFF_SQL}
+                GROUP BY role, content
+            )
+            """,
             (agent,),
         ).fetchone()[0]
 
@@ -381,8 +495,13 @@ def summarise_if_needed(agent: str) -> bool:
         # Keeps LLM input small regardless of total history length.
         with db._connect() as conn:
             delta_rows = conn.execute(
-                "SELECT ts, role, content FROM agent_conversations "
-                "WHERE agent = ? ORDER BY ts DESC LIMIT ?",
+                f"""
+                SELECT MAX(ts) as ts, role, content
+                FROM messages
+                WHERE agent = ? AND ts > {_RESET_CUTOFF_SQL}
+                GROUP BY role, content
+                ORDER BY MAX(ts) DESC LIMIT ?
+                """,
                 (agent, _RECENT_TURNS),
             ).fetchall()
         delta_rows = list(reversed(delta_rows))
@@ -398,8 +517,13 @@ def summarise_if_needed(agent: str) -> bool:
         # First trigger: no prior summary — fetch ALL turns so nothing is lost.
         with db._connect() as conn:
             all_rows = conn.execute(
-                "SELECT ts, role, content FROM agent_conversations "
-                "WHERE agent = ? ORDER BY ts ASC",
+                f"""
+                SELECT MAX(ts) as ts, role, content
+                FROM messages
+                WHERE agent = ? AND ts > {_RESET_CUTOFF_SQL}
+                GROUP BY role, content
+                ORDER BY MAX(ts) ASC
+                """,
                 (agent,),
             ).fetchall()
         if not all_rows:

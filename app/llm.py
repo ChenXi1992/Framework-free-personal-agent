@@ -24,14 +24,19 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from openai import OpenAI, OpenAIError
+from openai import OpenAI, OpenAIError, APITimeoutError, APIConnectionError, InternalServerError
 
 from . import audit, debug_log
 from .config import (
     DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, AGENT_TEMPERATURE, MAX_TOOL_TURNS,
+    LLM_TIMEOUT_SECONDS, LLM_MAX_RETRIES,
     DEBUG_LOG_LLM_RESPONSE, DEBUG_LOG_REASONING, DEBUG_LOG_FINISH_REASON, DEBUG_LOG_MESSAGES,
+    DEBUG_LOG_TOOL_CALLS, DEBUG_LOG_TOOL_SUMMARY, DEBUG_LOG_CONTEXT_SIZE, DEBUG_LOG_STAGE,
 )
 from .tools import registry
+
+# Errors worth retrying — transient network/server problems, not bad requests.
+_RETRYABLE = (APITimeoutError, APIConnectionError, InternalServerError)
 
 log = logging.getLogger(__name__)
 
@@ -112,7 +117,7 @@ def chat(
     system_prompt: str | None = None,
     agent: str = "",
     exclude_tools: frozenset[str] = frozenset(),
-    on_chunk: Callable[[list[ToolInvocation], str], None] | None = None,
+    on_chunk: Callable[[list[ToolInvocation], str, str], None] | None = None,
 ) -> ChatResult:
     """Run the agent loop for one user turn.
 
@@ -166,23 +171,58 @@ def chat(
             # because it's unchanged and would bloat every record.
             system_prompt_preview=(system_prompt or SYSTEM_PROMPT)[:600] if turn == 0 else None,
         )
-        t_llm = time.monotonic()
-        try:
-            resp = client.chat.completions.create(
-                model=DEEPSEEK_MODEL,
-                messages=messages,
-                tools=tools_payload if tools_payload else None,
-                tool_choice="auto" if tools_payload else None,
-                temperature=AGENT_TEMPERATURE,
+
+        # Context size: total chars in messages + tool schema bytes.
+        # Helps diagnose context bloat before the API call.
+        if DEBUG_LOG_CONTEXT_SIZE:
+            _msg_chars = sum(
+                len(str(m.get("content") or "")) + len(str(m.get("tool_calls") or ""))
+                for m in messages
             )
-        except OpenAIError as e:
-            log.exception("DeepSeek API error on turn %s", turn)
+            _schema_bytes = len(json.dumps(tools_payload)) if tools_payload else 0
+            debug_log.log(
+                "debug_context_size",
+                agent=agent or "general",
+                turn=turn,
+                messages_count=len(messages),
+                messages_chars=_msg_chars,
+                tool_schema_bytes=_schema_bytes,
+                tools_active=len(tools_payload),
+                total_chars=_msg_chars + _schema_bytes,
+            )
+        t_llm = time.monotonic()
+        resp = None
+        last_err: Exception | None = None
+        for attempt in range(LLM_MAX_RETRIES + 1):
+            try:
+                resp = client.chat.completions.create(
+                    model=DEEPSEEK_MODEL,
+                    messages=messages,
+                    tools=tools_payload if tools_payload else None,
+                    tool_choice="auto" if tools_payload else None,
+                    temperature=AGENT_TEMPERATURE,
+                    timeout=LLM_TIMEOUT_SECONDS,
+                )
+                break  # success
+            except _RETRYABLE as e:
+                last_err = e
+                log.warning(
+                    "DeepSeek transient error (turn %s, attempt %d/%d): %s",
+                    turn, attempt + 1, LLM_MAX_RETRIES + 1, type(e).__name__,
+                )
+                continue  # retry
+            except OpenAIError as e:
+                last_err = e
+                break  # non-retryable (bad request, auth, etc.) — give up now
+
+        if resp is None:
+            log.exception("DeepSeek API error on turn %s: %s", turn, last_err)
             audit.log_event(
                 "llm_error", user_id=user_id, turn=turn,
-                error=f"{type(e).__name__}: {e}",
+                error=f"{type(last_err).__name__}: {last_err}",
                 duration_ms=(time.monotonic() - t_llm) * 1000.0,
             )
-            return ChatResult(text=f"[LLM error: {e}]", invocations=invocations)
+            return ChatResult(text=f"[LLM error: {last_err}]", invocations=invocations)
         _resp_text = resp.choices[0].message.content or ""
         _usage = getattr(resp, "usage", None)
         audit.log_event(
@@ -274,22 +314,23 @@ def chat(
 
         if not msg.tool_calls:
             final_text = msg.content or "[empty response]"
+            _reasoning_final = getattr(msg, "reasoning_content", None) or ""
             if on_chunk:
                 # Fire the final chunk immediately; caller sends it directly.
-                on_chunk(turn_invocations, final_text)
+                on_chunk(turn_invocations, final_text, _reasoning_final)
             return ChatResult(
                 text=final_text,
                 invocations=invocations,
                 interim_texts=[] if on_chunk else interim_texts,
             )
 
-        # LLM emitted text alongside tool calls — deliver or buffer it.
-        if msg.content and msg.content.strip():
-            interim_text = msg.content.strip()
-            if on_chunk:
-                on_chunk(turn_invocations, interim_text)
-            else:
-                interim_texts.append(interim_text)
+        # Buffer any text and reasoning the LLM emitted alongside tool calls.
+        # We must NOT fire on_chunk yet — turn_invocations is still empty
+        # at this point (tools haven't run).  Deliver everything together
+        # after the tools complete so the caller always receives the full
+        # picture: which tools ran, what they returned, and any accompanying text.
+        _interim_text = (msg.content or "").strip()
+        _reasoning_this_turn = getattr(msg, "reasoning_content", None) or ""
 
         # Execute each tool call
         for tc in msg.tool_calls:
@@ -338,16 +379,83 @@ def chat(
                 duration_ms=duration_ms,
             )
 
+            # Debug: per-tool detail — name, filtered args, result preview, timing
+            if DEBUG_LOG_TOOL_CALLS:
+                # Filter out injected server-side fields (user_id, agent) —
+                # they add noise since the user didn't choose them.
+                _show_args = {k: v for k, v in args.items()
+                              if k not in ("user_id", "agent")}
+                # Truncate long string values so the log stays readable
+                _show_args = {
+                    k: (v[:200] + "…" if isinstance(v, str) and len(v) > 200 else v)
+                    for k, v in _show_args.items()
+                }
+                _result_preview = str(result)
+                if len(_result_preview) > 400:
+                    _result_preview = _result_preview[:400] + "…"
+                debug_log.log(
+                    "debug_tool_call",
+                    agent=agent or "general",
+                    turn=turn,
+                    name=name,
+                    args=_show_args,
+                    result=_result_preview,
+                    ok=ok,
+                    duration_ms=round(duration_ms, 1),
+                )
+
+            # When a tool stages a destructive action, record which agent staged
+            # it so /confirm can tag the confirmation note to the right agent
+            # (the general agent included — _last_used_agent excludes it).
+            if isinstance(result, dict) and result.get("staged") and result.get("action_id"):
+                try:
+                    from .tools import pending as _pending
+                    _pending.set_agent(result["action_id"], agent or "general")
+                except Exception:
+                    log.exception("Failed to stamp agent on staged action")
+                if DEBUG_LOG_STAGE:
+                    debug_log.log(
+                        "debug_stage_action",
+                        agent=agent or "general",
+                        turn=turn,
+                        tool=name,
+                        action_id=result.get("action_id", "?"),
+                        preview=result.get("preview", "")[:300],
+                    )
+
             messages.append({
                 "role": "tool",
                 "tool_call_id": tc.id,
                 "content": json.dumps(result, default=str),
             })
 
+        # Per-turn tool summary: names called, pass/fail, total wall-clock time.
+        # More readable than individual tool logs when multiple tools run per turn.
+        if DEBUG_LOG_TOOL_SUMMARY and turn_invocations:
+            debug_log.log(
+                "debug_tool_summary",
+                agent=agent or "general",
+                turn=turn,
+                tools=[inv.name for inv in turn_invocations],
+                results={inv.name: ("ok" if inv.ok else "ERROR") for inv in turn_invocations},
+                failed=[inv.name for inv in turn_invocations if not inv.ok],
+                total_ms=round(sum(inv.duration_ms for inv in turn_invocations), 1),
+            )
+
+        # All tools for this turn have run — turn_invocations is now populated.
+        # Fire on_chunk unconditionally so the caller sees each tool-call turn
+        # as it completes (step-by-step delivery) rather than all at once at
+        # the end.  Passes the completed invocations + any buffered text +
+        # any reasoning that preceded the tool calls.
+        if on_chunk:
+            on_chunk(turn_invocations, _interim_text, _reasoning_this_turn)
+        elif _interim_text:
+            interim_texts.append(_interim_text)
+
     log.warning("Hit MAX_TOOL_TURNS=%s without a final answer", MAX_TOOL_TURNS)
     cap_text = "[stopped: too many tool turns. Try a more specific question.]"
     if on_chunk:
-        on_chunk(turn_invocations, cap_text)
+        on_chunk(turn_invocations, cap_text, "")
     return ChatResult(
         text=cap_text,
         invocations=invocations,
@@ -426,7 +534,7 @@ def format_debug_header(invocations: list[ToolInvocation], max_chars: int = 1200
 
 def format_staged_footer(
     invocations: list[ToolInvocation],
-    preview_chars: int = 400,
+    preview_chars: int = 3000,
 ) -> str:
     """Return a structural footer listing any actions staged this turn.
 
@@ -452,6 +560,12 @@ def format_staged_footer(
         parts.append(f"[id: {aid}]")
         parts.append(preview)
         parts.append(f"→ /confirm {aid}   |   /cancel {aid}")
+    # When several actions are staged together, tell the user one 'confirm'
+    # executes them all — no need to confirm each id separately.
+    if len(staged) > 1:
+        parts.append("")
+        parts.append(f"✅ Reply 'confirm' to execute all {len(staged)}, "
+                     "or /confirm <id> for just one.")
     return "\n".join(parts)
 
 
@@ -459,7 +573,7 @@ def format_staged_footer(
 # These are local write tools where a hallucination claim ("I saved your note")
 # can't be verified from the LLM text alone — the user needs ground-truth
 # confirmation that the tool actually ran and returned ok.
-_WRITE_CONFIRM_TOOLS = {"note_add", "diary_add", "todo_add"}
+_WRITE_CONFIRM_TOOLS = {"note_add", "diary_add", "todo_add", "agent_handoff"}
 
 
 def format_write_confirmation(invocations: list[ToolInvocation]) -> str:

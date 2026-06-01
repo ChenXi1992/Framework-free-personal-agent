@@ -224,9 +224,13 @@ def _generate_summary(agent: str, year: int, week: int, notes: list[dict]) -> st
                 {"role": "user",   "content": user},
             ],
             temperature=0.3,   # summaries should be factual, low creativity
-            max_tokens=600,
+            max_tokens=2000,   # 600 was too tight — complex weeks with many notes
+                               # easily hit it mid-sentence; 2000 gives ample room
         )
-        return (resp.choices[0].message.content or "").strip()
+        text = (resp.choices[0].message.content or "").strip()
+        if not text:
+            log.warning("weekly_summary: LLM returned empty text for %s W%d/%d", agent, week, year)
+        return text
     except OpenAIError as e:
         log.error("weekly_summary: LLM call failed for %s W%d/%d: %s", agent, week, year, e)
         return (
@@ -331,8 +335,37 @@ async def check_and_send(
     # 4096-char limit and are easy to scroll through individually.
     for agent, year, week, summary in to_send:
         try:
-            await send_fn(summary)
-            # Small delay between messages so Telegram doesn't rate-limit us
+            for chunk in _split_for_telegram(summary):
+                await send_fn(chunk)
+                await asyncio.sleep(0.3)
             await asyncio.sleep(0.5)
         except Exception as e:  # noqa: BLE001
             log.error("weekly_summary: failed to send %s W%d/%d: %s", agent, week, year, e)
+
+
+def _split_for_telegram(text: str, limit: int = 4000) -> list[str]:
+    """Split text into chunks that fit within Telegram's message limit.
+
+    Splits preferentially at paragraph boundaries (\n\n), then at line
+    boundaries (\n), then hard-cuts as a last resort. Uses 4000 chars
+    (not 4096) to leave room for any Telegram markdown overhead.
+    """
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > limit:
+        # Try paragraph boundary
+        split_at = remaining.rfind("\n\n", 0, limit)
+        if split_at == -1:
+            # Try line boundary
+            split_at = remaining.rfind("\n", 0, limit)
+        if split_at == -1:
+            # Hard cut
+            split_at = limit
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks

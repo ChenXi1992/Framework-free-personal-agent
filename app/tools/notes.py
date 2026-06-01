@@ -19,9 +19,15 @@ _AGENTS_EX     = _AGENTS + ["all"]                    # includes 'all' for feedb
 # Notes
 # ---------------------------------------------------------------------------
 
+_DEDUP_WINDOW_SECONDS = 600  # 10 minutes
+
+
 @tool(
     description=(
-        "Store a note with a category and summary. Returns the new note id."
+        "Store a note with a category and summary. Returns the new note id.\n\n"
+        "Deduplication: if the exact same text was already stored in the same "
+        "category within the last 10 minutes, the existing note is returned "
+        "instead of creating a duplicate."
     ),
     parameters={
         "type": "object",
@@ -31,12 +37,27 @@ _AGENTS_EX     = _AGENTS + ["all"]                    # includes 'all' for feedb
                          "description": "Agent domain this note belongs to, or 'uncategorized'."},
             "summary":  {"type": "string", "description": "One-sentence summary, max 20 words."},
         },
-        "required": ["text", "category", "summary"],
+        "required": ["category", "summary"],
     },
 )
-def note_add(text: str, category: str, summary: str) -> dict[str, Any]:
-    """Insert a classified note into the database and return its new row id."""
+def note_add(text: str = "", category: str = "uncategorized", summary: str = "") -> dict[str, Any]:
+    """Insert a classified note, skipping exact duplicates within the dedup window."""
+    # LLM occasionally omits text or summary — fall back gracefully rather than crashing.
+    if not text.strip():
+        text = summary
+    if not summary.strip():
+        summary = text[:100]
+    if not text.strip():
+        return {"ok": False, "error": "note_add requires at least text or summary"}
+    cutoff = int(time.time()) - _DEDUP_WINDOW_SECONDS
     with _connect() as conn:
+        existing = conn.execute(
+            "SELECT id FROM notes "
+            "WHERE category = ? AND raw_text = ? AND ts >= ?",
+            (category, text, cutoff),
+        ).fetchone()
+        if existing:
+            return {"ok": True, "id": existing[0], "category": category, "duplicate": True}
         cur = conn.execute(
             "INSERT INTO notes(ts, created_at, raw_text, category, summary) VALUES (?,?,?,?,?)",
             (int(time.time()), _utc_now(), text, category, summary),
@@ -152,12 +173,21 @@ def notes_search(query: str, category: str = "all", limit: int = 10) -> dict[str
     agent_scoped=True,
 )
 def conversation_recent(agent: str, limit: int = 20) -> dict[str, Any]:
-    """Return the most recent conversation turns for an agent, oldest-first."""
+    """Return the most recent conversation turns for an agent, oldest-first.
+
+    Reads from messages. GROUP BY (role, content) collapses any duplicates;
+    MAX(id)/MAX(ts) pick the most recent occurrence.
+    """
     limit = min(max(1, limit), 100)
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT id, ts, role, content FROM agent_conversations "
-            "WHERE agent = ? ORDER BY ts DESC LIMIT ?",
+            """
+            SELECT MAX(id) as id, MAX(ts) as ts, role, content
+            FROM messages
+            WHERE agent = ?
+            GROUP BY role, content
+            ORDER BY MAX(ts) DESC LIMIT ?
+            """,
             (agent, limit),
         ).fetchall()
     turns = [{"id": r[0], "ts": r[1], "role": r[2], "content": r[3]} for r in reversed(rows)]

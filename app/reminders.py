@@ -2,7 +2,7 @@
 
 Runs as a repeating job inside the Telegram bot's job_queue (every minute).
 For each active reminder that is due today at the current time:
-  1. Check if a session already happened today (query agent_conversations).
+  1. Check if a session already happened today (query messages).
   2. If messages exist — ask the LLM to judge whether it was a meaningful session.
   3. If no session (or LLM says no) — generate a smart push message and send it.
   4. Mark last_fired so it doesn't fire twice in the same day.
@@ -77,7 +77,7 @@ def _load_file(path) -> str:
 
 
 def _get_today_conversations(agent: str) -> list[dict]:
-    """Return today's agent_conversations rows for the given agent."""
+    """Return today's conversation turns for the given agent (from messages)."""
     tz = ZoneInfo(TIMEZONE)
     start_of_day = int(
         datetime.datetime.combine(
@@ -86,8 +86,13 @@ def _get_today_conversations(agent: str) -> list[dict]:
     )
     with _connect() as conn:
         rows = conn.execute(
-            "SELECT role, content FROM agent_conversations "
-            "WHERE agent = ? AND ts >= ? ORDER BY ts ASC",
+            """
+            SELECT role, content
+            FROM messages
+            WHERE agent = ? AND ts >= ?
+            GROUP BY role, content
+            ORDER BY MAX(ts) ASC
+            """,
             (agent, start_of_day),
         ).fetchall()
     return [{"role": r[0], "content": r[1]} for r in rows]

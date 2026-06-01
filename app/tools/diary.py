@@ -4,12 +4,13 @@ Each entry is written with a datestamp header and optional category tags
 (#workout, #lifestyle, #career, etc.).  The file is intentionally plain
 Markdown so it can be read, searched, and exported without any tooling.
 
+All writes are staged — the user must confirm before any entry lands on disk.
+
 Design notes:
   - diary.md is append-only from the tool's perspective; no editing or
     deletion of past entries is supported.
   - The agent is responsible for extracting structured data (notes, todos,
-    goals) from diary entries using the appropriate tools *after* calling
-    diary_add.
+    goals) from diary entries using the appropriate tools *after* confirming.
   - A diary entry is always a note conceptually, but the diary file is the
     primary record.  The notes DB contains extracted highlights, not the
     full narrative.
@@ -21,11 +22,12 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from .pending import stage_action
 from .registry import tool
 
 log = logging.getLogger(__name__)
 
-_DATA_DIR = Path(__file__).parent.parent.parent / "data"
+_DATA_DIR   = Path(__file__).parent.parent.parent / "data"
 _DIARY_PATH = _DATA_DIR / "diary.md"
 
 
@@ -44,11 +46,11 @@ def _today_header(categories: list[str]) -> str:
 @tool(
     description=(
         "Append a diary / journal entry to diary.md. "
+        "STAGED — nothing is written until the user confirms. "
         "Call this whenever the user shares personal reflections, daily logs, "
         "or any narrative they want kept in their diary. "
-        "After writing the entry you SHOULD also call note_add, todo_add, or "
-        "goal-related tools to extract any structured items embedded in the text "
-        "(e.g. a workout logged in a diary entry should also go into notes)."
+        "After the user confirms, also call note_add, todo_add, or goal-related "
+        "tools to extract any structured items embedded in the text."
     ),
     parameters={
         "type": "object",
@@ -62,30 +64,33 @@ def _today_header(categories: list[str]) -> str:
                 "items": {"type": "string"},
                 "description": (
                     "Zero or more category tags to attach to this entry "
-                    "(e.g. ['workout', 'lifestyle']).  Used for filtering later."
+                    "(e.g. ['workout', 'lifestyle']). Used for filtering later."
                 ),
             },
+            "user_id": {"type": "integer"},
         },
-        "required": ["entry"],
+        "required": ["entry", "user_id"],
     },
+    destructive=True,
 )
-def diary_add(entry: str, categories: list[str] | None = None) -> dict[str, Any]:
-    """Append one dated entry to data/diary.md and return a confirmation."""
+def diary_add(entry: str, user_id: int, categories: list[str] | None = None) -> dict[str, Any]:
+    """Stage appending one dated entry to data/diary.md."""
     cats = [c.strip().lower() for c in (categories or []) if c.strip()]
     header = _today_header(cats)
     block = f"{header}\n\n{entry.strip()}\n\n---\n\n"
 
-    _DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with _DIARY_PATH.open("a", encoding="utf-8") as f:
-        f.write(block)
-
-    log.debug("Diary entry appended (%d chars, tags=%s)", len(entry), cats)
-    return {
-        "ok": True,
-        "path": str(_DIARY_PATH),
-        "categories": cats,
-        "entry_preview": entry[:120] + ("…" if len(entry) > 120 else ""),
-    }
+    tag_str = "  " + " ".join(f"#{c}" for c in cats) if cats else ""
+    preview = (
+        f"Diary entry{tag_str}:\n"
+        f"  {entry[:200]!r}{'…' if len(entry) > 200 else ''}"
+    )
+    action_id = stage_action(
+        user_id=user_id,
+        tool_name="diary_add",
+        arguments={"block": block, "categories": cats},
+        preview=preview,
+    )
+    return {"staged": True, "action_id": action_id, "preview": preview}
 
 
 @tool(
@@ -102,7 +107,7 @@ def diary_add(entry: str, categories: list[str] | None = None) -> dict[str, Any]
                 "type": "string",
                 "description": (
                     "Filter to entries tagged with this category "
-                    "(e.g. 'workout').  Omit or pass '' to return all entries."
+                    "(e.g. 'workout'). Omit or pass '' to return all entries."
                 ),
             },
             "limit": {
@@ -121,8 +126,6 @@ def diary_recent(category: str = "", limit: int = 5) -> dict[str, Any]:
         return {"entries": [], "total": 0}
 
     raw = _DIARY_PATH.read_text(encoding="utf-8")
-
-    # Split on the separator; each block starts with "## YYYY-MM-DD HH:MM"
     blocks = [b.strip() for b in raw.split("\n---\n") if b.strip()]
 
     entries = []
@@ -132,9 +135,6 @@ def diary_recent(category: str = "", limit: int = 5) -> dict[str, Any]:
             continue
         header_line = lines[0]
         body = "\n".join(lines[1:]).strip()
-        # Extract category tags like #workout, #lifestyle from the header line.
-        # Skip the "##" heading marker (len==2, second char is "#" not alpha)
-        # and date tokens like "#2026" (second char is a digit).
         tags = [
             w[1:].lower()
             for w in header_line.split()
@@ -147,3 +147,24 @@ def diary_recent(category: str = "", limit: int = 5) -> dict[str, Any]:
             break
 
     return {"entries": entries, "total": len(entries)}
+
+
+# ---------------------------------------------------------------------------
+# Executor (called by /confirm handler in main.py)
+# ---------------------------------------------------------------------------
+
+def execute_confirmed(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Execute a staged diary action after user confirmation."""
+    try:
+        if tool_name == "diary_add":
+            block = arguments["block"]
+            _DATA_DIR.mkdir(parents=True, exist_ok=True)
+            with _DIARY_PATH.open("a", encoding="utf-8") as f:
+                f.write(block)
+            log.debug("Diary entry confirmed (%d chars)", len(block))
+            return {"ok": True, "bytes": len(block)}
+
+        return {"ok": False, "error": f"Unknown tool: {tool_name}"}
+    except Exception as exc:  # noqa: BLE001
+        log.exception("execute_confirmed failed for %s", tool_name)
+        return {"ok": False, "error": str(exc)}

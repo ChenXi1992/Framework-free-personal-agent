@@ -5,10 +5,8 @@ Auth: an OAuth refresh token is read from `./data/gmail_token.json`. Run
 that file. The token auto-refreshes; this module only needs `gmail_token.json`
 and `gmail_credentials.json` to be present.
 
-Read tools execute immediately. `send_message` is destructive (irreversible
-once Gmail accepts it) and goes through the pending-action flow. `trash_message`
-executes immediately because Gmail keeps trashed mail for 30 days, so it's
-recoverable.
+Read tools execute immediately. Both `send_message` and `trash_message` are
+staged — nothing executes until the user confirms.
 """
 from __future__ import annotations
 
@@ -211,24 +209,29 @@ def gmail_create_draft(
 
 @tool(
     description=(
-        "Move a message to Gmail Trash. Trashed mail is recoverable for 30 days, "
-        "so this is safe to execute immediately without /confirm. To permanently "
-        "delete, the user must empty Trash in the Gmail UI."
+        "Move a message to Gmail Trash. STAGED — requires confirmation before executing. "
+        "Trashed mail is recoverable for 30 days from the Gmail Trash folder."
     ),
     parameters={
         "type": "object",
         "properties": {
-            "message_id": {"type": "string"},
+            "message_id": {"type": "string", "description": "Gmail message ID to trash."},
+            "subject":    {"type": "string", "description": "Subject line for preview (call gmail_get_message first)."},
+            "user_id":    {"type": "integer"},
         },
-        "required": ["message_id"],
+        "required": ["message_id", "user_id"],
     },
+    destructive=True,
 )
-def gmail_trash_message(message_id: str) -> dict[str, Any]:
-    try:
-        _get_service().users().messages().trash(userId="me", id=message_id).execute()
-    except (HttpError, RuntimeError) as e:
-        return {"error": f"Gmail: {e}"}
-    return {"ok": True}
+def gmail_trash_message(message_id: str, user_id: int, subject: str = "") -> dict[str, Any]:
+    preview = f"Move to Trash: \"{subject or message_id}\""
+    action_id = stage_action(
+        user_id=user_id,
+        tool_name="gmail_trash_message",
+        arguments={"message_id": message_id, "subject": subject},
+        preview=preview,
+    )
+    return {"staged": True, "action_id": action_id, "preview": preview}
 
 
 # ---------------------------------------------------------------------------
@@ -307,4 +310,12 @@ def execute_confirmed(tool_name: str, arguments: dict[str, Any]) -> dict[str, An
         except (HttpError, RuntimeError) as e:
             return {"ok": False, "error": str(e)}
         return {"ok": True, "message_id": sent.get("id")}
+    if tool_name == "gmail_trash_message":
+        try:
+            _get_service().users().messages().trash(
+                userId="me", id=arguments["message_id"]
+            ).execute()
+        except (HttpError, RuntimeError) as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True}
     return {"ok": False, "error": f"unknown tool: {tool_name}"}

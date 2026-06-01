@@ -159,6 +159,7 @@ def file_list(*, path: str = ".") -> str:
 def file_write(*, path: str, content: str, user_id: int) -> dict[str, Any]:
     target = _safe_path(path)
     _check_extension(target)
+    _check_not_prompt_file(path)
     preview = (
         f"Write file: {path}\n"
         f"  Size: {len(content)} characters\n"
@@ -210,6 +211,7 @@ def file_write(*, path: str, content: str, user_id: int) -> dict[str, Any]:
 def file_edit(*, path: str, old_text: str, new_text: str, user_id: int) -> dict[str, Any]:
     target = _safe_path(path)
     _check_extension(target)
+    _check_not_prompt_file(path)
     if not target.exists():
         raise FileNotFoundError(f"File not found: {path}")
     content = target.read_text(encoding="utf-8")
@@ -268,6 +270,7 @@ def file_edit(*, path: str, old_text: str, new_text: str, user_id: int) -> dict[
 def file_append(*, path: str, text: str, user_id: int) -> dict[str, Any]:
     target = _safe_path(path)
     _check_extension(target)
+    _check_not_prompt_file(path)
     if not target.exists():
         raise FileNotFoundError(f"File not found: {path}")
     preview = (
@@ -287,19 +290,50 @@ def file_append(*, path: str, text: str, user_id: int) -> dict[str, Any]:
 # Executor (called by /confirm handler in main.py)
 # ---------------------------------------------------------------------------
 
+_PROMPTS_SUBDIR = "prompts"
+
+
+def _check_not_prompt_file(path: str) -> None:
+    """Raise if the path targets the prompts/ directory.
+
+    Prompt files must be modified via the section tools (prompt_replace_section /
+    prompt_add_section) — NOT via file_write/file_edit/file_append. This prevents
+    the agent from accidentally (or erroneously) overwriting its own persona with
+    empty content or completely wrong text.
+    """
+    norm = path.replace("\\", "/").lstrip("/")
+    if norm.startswith(_PROMPTS_SUBDIR + "/"):
+        raise ValueError(
+            f"Cannot write to {path!r} via file_write/file_edit/file_append. "
+            "Prompt files must be edited with prompt_replace_section() or "
+            "prompt_add_section() so changes go through the staged, validated flow."
+        )
+
+
 def execute_confirmed(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Execute a previously staged file action after user confirmation."""
     try:
         if tool_name == "file_write":
             target = _safe_path(arguments["path"])
             _check_extension(target)
+            _check_not_prompt_file(arguments["path"])
+            content = arguments["content"]
+            if not content.strip():
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Refused: content for {arguments['path']!r} is empty. "
+                        "Writing an empty file is almost never correct — check the content."
+                    ),
+                }
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(arguments["content"], encoding="utf-8")
-            return {"ok": True, "bytes": len(arguments["content"])}
+            target.write_text(content, encoding="utf-8")
+            return {"ok": True, "bytes": len(content)}
 
         if tool_name == "file_edit":
             target = _safe_path(arguments["path"])
             _check_extension(target)
+            _check_not_prompt_file(arguments["path"])
             content = target.read_text(encoding="utf-8")
             new_content = content.replace(arguments["old_text"], arguments["new_text"], 1)
             target.write_text(new_content, encoding="utf-8")
@@ -308,6 +342,7 @@ def execute_confirmed(tool_name: str, arguments: dict[str, Any]) -> dict[str, An
         if tool_name == "file_append":
             target = _safe_path(arguments["path"])
             _check_extension(target)
+            _check_not_prompt_file(arguments["path"])
             with target.open("a", encoding="utf-8") as fh:
                 fh.write(arguments["text"])
             return {"ok": True}
