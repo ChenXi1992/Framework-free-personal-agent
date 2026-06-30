@@ -106,8 +106,8 @@ def agent_handoff(agent: str, to_agent: str, message: str) -> dict[str, Any]:
     summary = f"[Handoff from {agent}] {message}"
     with _connect() as conn:
         cur = conn.execute(
-            "INSERT INTO notes(ts, created_at, raw_text, category, summary) "
-            "VALUES (?,?,?,?,?)",
-            (int(time.time()), _utc_now(), summary, to_agent, summary),
+            "INSERT INTO notes(ts, created_at, raw_text, category, summary, role) "
+            "VALUES (?,?,?,?,?,?)",
+            (int(time.time()), _utc_now(), summary, to_agent, summary, "system"),
         )
     return {"ok": True, "to_agent": to_agent, "id": cur.lastrowid}

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import time
 
 from zoneinfo import ZoneInfo
 
@@ -58,6 +59,12 @@ def _is_due(days: str, fire_time: str, now: datetime.datetime) -> bool:
     bot wakes up. Double-firing is prevented by the `last_fired == today`
     check in check_due_reminders, which is set after the first fire.
     """
+    # Guard: once reminders have empty days/fire_time and should never reach
+    # here (the scheduler checks `if once: continue` first), but if they do,
+    # return False rather than crashing on int("").
+    if not days or not fire_time:
+        return False
+
     today_name = _WEEKDAY_NAMES[now.weekday()]
     day_list = [d.strip() for d in days.split(",")]
     if "daily" not in day_list and today_name not in day_list:
@@ -184,18 +191,40 @@ def _generate_reminder_message(agent: str, label: str) -> str:
 
 async def check_due_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Job that runs every minute — checks for due reminders and fires them."""
+    import asyncio
+
     now = _now_local()
     today = _today_str()
+    now_ts = int(time.time())
 
     with _connect() as conn:
         due = conn.execute(
-            "SELECT id, agent, label, days, fire_time, last_fired "
+            "SELECT id, agent, label, days, fire_time, last_fired, "
+            "COALESCE(once, 0), fire_at "
             "FROM reminders WHERE active = 1"
         ).fetchall()
 
     for row in due:
-        rid, agent, label, days, fire_time, last_fired = row
+        rid, agent, label, days, fire_time, last_fired, once, fire_at = row
 
+        # ── One-time reminder ────────────────────────────────────────────────
+        if once:
+            if fire_at is None or now_ts < fire_at:
+                continue  # not yet due
+            log.info("reminders: firing one-time '%s'", label)
+            message = f"⏰ {label}"
+            for user_id in ALLOWED_USERS:
+                try:
+                    await context.bot.send_message(chat_id=user_id, text=message)
+                    log.info("reminders: pushed one-time '%s' to user %s", label, user_id)
+                except Exception as e:  # noqa: BLE001
+                    log.error("reminders: failed to push to %s: %s", user_id, e)
+            # Deactivate — one-time reminders only fire once
+            with _connect() as conn:
+                conn.execute("UPDATE reminders SET active = 0 WHERE id = ?", (rid,))
+            continue
+
+        # ── Recurring reminder ───────────────────────────────────────────────
         if not _is_due(days, fire_time, now):
             continue
         if last_fired == today:
@@ -204,7 +233,6 @@ async def check_due_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
         log.info("reminders: checking %s / '%s'", agent, label)
 
         # Judge session quality in a thread (blocking LLM call)
-        import asyncio
         conversations = _get_today_conversations(agent)
         meaningful = await asyncio.get_running_loop().run_in_executor(
             None, _judge_session, agent, conversations

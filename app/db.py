@@ -6,11 +6,6 @@ tasks don't block each other.
 Every table stores two timestamp representations:
   ts         INTEGER  — Unix epoch seconds (fast to sort/index, compact)
   created_at TEXT     — 'YYYY-MM-DD HH:MM:SS' UTC (human-readable in DB Browser)
-
-Health tables use the same pattern:
-  date       TEXT     — 'YYYYMMDD' (compact date format, used as primary key)
-  date_iso   TEXT     — 'YYYY-MM-DD' (readable equivalent of date)
-  datetime_utc TEXT   — 'YYYY-MM-DD HH:MM:SS' UTC (for heart_rate / sport_minute)
 """
 from __future__ import annotations
 
@@ -59,64 +54,6 @@ CREATE TABLE IF NOT EXISTS feedback (
     note        TEXT    NOT NULL
 );
 
--- Health: daily summary (steps, distance, calories, HR, sleep)
-CREATE TABLE IF NOT EXISTS health_daily (
-    date            TEXT PRIMARY KEY,  -- YYYYMMDD
-    date_iso        TEXT,              -- YYYY-MM-DD (human-readable)
-    steps           INTEGER,
-    distance_m      INTEGER,
-    calories_kcal   REAL,
-    duration_min    INTEGER,
-    altitude_m      REAL,
-    resting_hr      INTEGER,
-    max_hr          INTEGER,
-    min_hr          INTEGER,
-    spo2_avg        REAL,
-    sleep_total_min INTEGER,
-    sleep_deep_min  INTEGER,
-    sleep_light_min INTEGER,
-    sleep_rem_min   INTEGER,
-    sleep_awake_min INTEGER
-);
-
--- Health: daily totals broken down by sport type
-CREATE TABLE IF NOT EXISTS sport_daily (
-    date          TEXT NOT NULL,   -- YYYYMMDD
-    date_iso      TEXT,            -- YYYY-MM-DD
-    sport_type    INTEGER NOT NULL,
-    sport_name    TEXT NOT NULL,
-    steps         INTEGER,
-    distance_m    INTEGER,
-    calories_kcal REAL,
-    duration_min  INTEGER,
-    PRIMARY KEY (date, sport_type)
-);
-
--- Health: heart rate time series (one row per reading)
-CREATE TABLE IF NOT EXISTS heart_rate (
-    ts           INTEGER PRIMARY KEY,  -- unix seconds
-    date         TEXT NOT NULL,        -- YYYYMMDD for fast date queries
-    datetime_utc TEXT NOT NULL,        -- 'YYYY-MM-DD HH:MM:SS' UTC
-    bpm          REAL NOT NULL,
-    kind         TEXT NOT NULL         -- 'dynamic' | 'resting'
-);
-CREATE INDEX IF NOT EXISTS idx_hr_date ON heart_rate(date);
-
--- Health: per-minute activity breakdown
-CREATE TABLE IF NOT EXISTS sport_minute (
-    ts            INTEGER PRIMARY KEY,  -- unix seconds (start of minute)
-    date          TEXT NOT NULL,        -- YYYYMMDD
-    datetime_utc  TEXT NOT NULL,        -- 'YYYY-MM-DD HH:MM:SS' UTC
-    sport_type    INTEGER NOT NULL,
-    sport_name    TEXT NOT NULL,
-    steps         INTEGER,
-    distance_m    INTEGER,
-    calories_kcal REAL,
-    altitude_m    REAL,
-    duration_min  INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_sm_date ON sport_minute(date);
-
 CREATE TABLE IF NOT EXISTS reminders (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ts          INTEGER NOT NULL,
@@ -128,19 +65,6 @@ CREATE TABLE IF NOT EXISTS reminders (
     active      INTEGER NOT NULL DEFAULT 1,
     last_fired  TEXT               -- "YYYY-MM-DD" — prevents double-fire on same day
 );
-
-CREATE TABLE IF NOT EXISTS weekly_summaries (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts          INTEGER NOT NULL,
-    created_at  TEXT    NOT NULL,
-    agent       TEXT    NOT NULL,
-    year        INTEGER NOT NULL,
-    week        INTEGER NOT NULL,
-    summary     TEXT    NOT NULL,
-    UNIQUE(agent, year, week)
-);
-CREATE INDEX IF NOT EXISTS idx_weekly_summaries_agent
-    ON weekly_summaries(agent, year, week);
 
 CREATE TABLE IF NOT EXISTS conversation_summaries (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -161,12 +85,12 @@ _MIGRATIONS = [
     ("messages",            "created_at  TEXT NOT NULL DEFAULT '1970-01-01 00:00:00'"),
     ("messages",            "agent       TEXT"),          # which specialist handled this turn
     ("notes",               "created_at  TEXT NOT NULL DEFAULT '1970-01-01 00:00:00'"),
+    ("notes",               "role        TEXT NOT NULL DEFAULT 'user'"),  # 'user' or 'assistant'
 
     ("feedback",            "created_at  TEXT NOT NULL DEFAULT '1970-01-01 00:00:00'"),
-    ("health_daily",        "date_iso    TEXT"),
-    ("sport_daily",         "date_iso    TEXT"),
-    ("heart_rate",          "datetime_utc TEXT NOT NULL DEFAULT '1970-01-01 00:00:00'"),
-    ("sport_minute",        "datetime_utc TEXT NOT NULL DEFAULT '1970-01-01 00:00:00'"),
+    # One-time reminders (reminder_once tool)
+    ("reminders",           "once        INTEGER NOT NULL DEFAULT 0"),  # 1 = one-time, 0 = recurring
+    ("reminders",           "fire_at     INTEGER"),                     # Unix ts; only for once=1
 ]
 
 
@@ -287,18 +211,6 @@ def _migrate(conn: sqlite3.Connection) -> None:
             f"UPDATE {table} SET created_at = datetime(ts, 'unixepoch') "
             f"WHERE created_at IS NULL OR created_at = '1970-01-01 00:00:00'"
         )
-    for table in ("heart_rate", "sport_minute"):
-        conn.execute(
-            f"UPDATE {table} SET datetime_utc = datetime(ts, 'unixepoch') "
-            f"WHERE datetime_utc IS NULL OR datetime_utc = '1970-01-01 00:00:00'"
-        )
-    # Convert stored YYYYMMDD → YYYY-MM-DD for the two health date columns.
-    for table in ("health_daily", "sport_daily"):
-        conn.execute(
-            f"UPDATE {table} SET date_iso = "
-            f"substr(date,1,4)||'-'||substr(date,5,2)||'-'||substr(date,7,2) "
-            f"WHERE date_iso IS NULL"
-        )
 
 
 def init() -> None:
@@ -408,3 +320,22 @@ def recent_history(user_id: int, limit: int = 20) -> list[dict[str, str]]:
             (user_id, limit),
         ).fetchall()
     return [{"role": role, "content": content} for role, content in reversed(list(rows))]
+
+
+def log_note(category: str, role: str, text: str) -> int:
+    """Append one turn to the notes table under the given agent category.
+
+    Called automatically by main.py after every exchange — both the user
+    message (role='user') and the agent response (role='assistant') are stored.
+    Agents no longer need to call note_add for raw logging; the system does it.
+
+    Returns the new row id.
+    """
+    summary = text[:120]
+    with _connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO notes(ts, created_at, raw_text, category, summary, role) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (int(time.time()), _utc_now(), text, category, summary, role),
+        )
+        return cur.lastrowid

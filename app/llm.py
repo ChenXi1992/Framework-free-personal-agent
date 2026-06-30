@@ -336,28 +336,38 @@ def chat(
         for tc in msg.tool_calls:
             name = tc.function.name
             t0 = time.monotonic()
-            try:
-                args = json.loads(tc.function.arguments or "{}")
-            except json.JSONDecodeError as e:
+            if name in exclude_tools:
+                # The model called a tool excluded from this turn's schema.
+                # Excluding only hides it from the advertised schema; the model
+                # can still emit the call from training. Refuse execution here
+                # so it can't perform the excluded action — return an error the
+                # model sees and moves on from.
                 args = {}
-                result: Any = {"error": f"invalid arguments JSON: {e}"}
+                result = {"error": f"{name} is not available on this turn — already handled."}
                 ok = False
             else:
-                # Inject server-side fields the LLM never sees in the schema.
-                # Always override — anything the model put here is a hallucination.
-                if name in registry.REGISTRY:
-                    t = registry.REGISTRY[name]
-                    if t.destructive:
-                        args["user_id"] = user_id
-                    if t.agent_scoped:
-                        args["agent"] = agent
                 try:
-                    result = registry.dispatch(name, args)
-                    ok = not (isinstance(result, dict) and "error" in result)
-                except Exception as e:  # noqa: BLE001 — surface any tool error to the LLM
-                    log.exception("Tool %s raised %s", name, type(e).__name__)
-                    result = {"error": f"{type(e).__name__}: {e}"}
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError as e:
+                    args = {}
+                    result: Any = {"error": f"invalid arguments JSON: {e}"}
                     ok = False
+                else:
+                    # Inject server-side fields the LLM never sees in the schema.
+                    # Always override — anything the model put here is a hallucination.
+                    if name in registry.REGISTRY:
+                        t = registry.REGISTRY[name]
+                        if t.destructive:
+                            args["user_id"] = user_id
+                        if t.agent_scoped:
+                            args["agent"] = agent
+                    try:
+                        result = registry.dispatch(name, args)
+                        ok = not (isinstance(result, dict) and "error" in result)
+                    except Exception as e:  # noqa: BLE001 — surface any tool error to the LLM
+                        log.exception("Tool %s raised %s", name, type(e).__name__)
+                        result = {"error": f"{type(e).__name__}: {e}"}
+                        ok = False
 
             duration_ms = (time.monotonic() - t0) * 1000.0
             inv = ToolInvocation(
@@ -573,7 +583,7 @@ def format_staged_footer(
 # These are local write tools where a hallucination claim ("I saved your note")
 # can't be verified from the LLM text alone — the user needs ground-truth
 # confirmation that the tool actually ran and returned ok.
-_WRITE_CONFIRM_TOOLS = {"note_add", "diary_add", "todo_add", "agent_handoff"}
+_WRITE_CONFIRM_TOOLS = {"diary_add", "todo_add", "agent_handoff"}
 
 
 def format_write_confirmation(invocations: list[ToolInvocation]) -> str:

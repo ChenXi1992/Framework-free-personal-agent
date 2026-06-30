@@ -1,9 +1,9 @@
 """Agent router: classification and context assembly.
 
 Pass 1 — Router LLM call (route()):
-    Single LLM call classifies the user message into {type, agent, category, summary}.
-    Types: note | diary | chat.
-    For notes, summary is a router-generated one-liner stored directly in the notes table.
+    Single LLM call classifies the user message and returns {agent}.
+    Both the user message and agent response are auto-stored in the notes table
+    by main.py after each exchange — agents do not need to call any storage tool.
 
 Pass 2 — Context assembly (_build_agent_context()):
     Injects today's date, recent notes, personal profile, and agent-specific goals
@@ -81,7 +81,7 @@ _client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 
 SKILLS_DIR = PROMPTS_DIR / "skills"
 
-_SKILL_FILES = {"grill", "notion"}  # files that live in prompts/skills/, not prompts/
+_SKILL_FILES = {"grill", "notion", "clarify", "alerts"}  # files that live in prompts/skills/, not prompts/
 
 
 def _load_prompt(name: str) -> str:
@@ -144,13 +144,15 @@ def _llm_json(
     """
     last_raw = ""
     last_usage: dict | None = None
-    messages = [{"role": "system", "content": system}]
-    if prior_turns:
-        messages.extend(prior_turns)
+    messages = [
+        {"role": "system", "content": system},
+        *(prior_turns or []),
+        {"role": "user", "content": user},
+    ]
     for attempt in range(retries + 1):
         resp = _client.chat.completions.create(
             model=DEEPSEEK_MODEL,
-            messages=messages + [{"role": "user", "content": user}],
+            messages=messages,
             temperature=_ROUTER_TEMPERATURE,
             max_tokens=_ROUTER_MAX_TOKENS,
         )
@@ -175,44 +177,32 @@ def _llm_json(
 
 def route(
     user_message: str,
-    recent_context: str = "",
     history: list[dict] | None = None,
 ) -> dict[str, str]:
-    """Classify a user message. Returns {type, agent, category, summary}.
+    """Classify a user message. Returns {agent}.
 
     `history` is an optional list of recent turns (last N messages as
-    {"role": "user"/"assistant", "content": "..."} dicts). When provided,
-    they are passed to the LLM before the classification request so the
-    router can resolve corrections, follow-ups, and mid-conversation topic
-    switches that carry no agent signal on their own.
-
-    `recent_context` (legacy string hint) is still supported; it is appended
-    to the user message when no history is provided.
+    {"role": "user"/"assistant", "content": "..."} dicts). Passed to the LLM
+    before the classification request so the router can resolve follow-ups,
+    corrections, and topic switches that carry no domain signal on their own.
     """
-    # Build the classification prompt — append the legacy hint when no
-    # structured history is available (backward compat).
-    prompt_text = user_message
-    if recent_context and not history:
-        prompt_text = f"{user_message}\n\n[Context: {recent_context}]"
-
     router_system = _load_prompt("router")
     raw = ""
     usage: dict | None = None
     attempts = 0
     try:
         result, raw, usage, attempts = _llm_json(
-            router_system, prompt_text, prior_turns=history or None
+            router_system, user_message, prior_turns=history
         )
     except (OpenAIError, json.JSONDecodeError, KeyError, ValueError) as e:
         log.warning("Router failed (%s: %s), defaulting to general/none", type(e).__name__, e)
-        result = {"type": "chat", "agent": "none", "category": "none"}
+        result = {"agent": "none"}
 
     # Always: log the routing decision (summary) to the audit log.
     audit.log_event(
         "route_decision",
-        input_preview=prompt_text[:200],
+        input_preview=user_message[:200],
         result=result,
-        had_context_hint=bool(recent_context),
         history_turns=len(history) if history else 0,
     )
 
@@ -221,7 +211,7 @@ def route(
         debug_log.log(
             "debug_router_call",
             system_prompt=router_system,
-            user_input=prompt_text,
+            user_input=user_message,
             raw_response=raw,
             parsed_result=result,
             usage=usage,
@@ -235,7 +225,7 @@ def route(
 # Context assembly for agents
 # ---------------------------------------------------------------------------
 
-def _build_agent_context(agent: str, category: str) -> str:
+def _build_agent_context(agent: str) -> str:
     """Build the context block injected into the agent system prompt.
 
     Always starts with today's date so the LLM uses the correct year for any
@@ -250,7 +240,6 @@ def _build_agent_context(agent: str, category: str) -> str:
             "NEVER say something was saved, added, updated, or logged unless you actually "
             "called the relevant tool in this same response and it returned ok.\n"
             "If you want to add a todo → call todo_add. "
-            "If you want to save a note → call note_add. "
             "If you want to write a file → call file_write or file_append. "
             "Saying 'Done!' without calling the tool is a lie — do not do it.\n\n"
             "## Never fabricate — search first — CRITICAL\n"
@@ -268,6 +257,14 @@ def _build_agent_context(agent: str, category: str) -> str:
             "than a real log or request, ask ONE clarifying question before treating it as "
             "real. Don't convert a narrative or practice message into domain-action mode "
             "(e.g. reading an injury into a storytelling sample).\n\n"
+            "## Check the date before summing — CRITICAL\n"
+            f"Today is {today}. When you total or aggregate sessions (workout minutes, "
+            "Dutch/LingQ time, screen time, etc.) or base a proposal on logged data, "
+            "verify the DATE of each entry first. NEVER add up sessions from different days "
+            "into a single day's total. 'Today's total' includes only entries dated today. "
+            "If you reference an earlier session, state its actual date ('20 min on May 29') "
+            "— do not silently fold it into today. When unsure which day an entry belongs to, "
+            "check the note's timestamp rather than assuming it's today.\n\n"
             "## Tool use rules\n"
             "Destructive tools (calendar_create_event, gmail_send_message, etc.) stage "
             "the action — nothing executes until the user confirms. "
@@ -287,33 +284,63 @@ def _build_agent_context(agent: str, category: str) -> str:
             "agent_handoff(to_agent='workout', message='User is practising storytelling "
             "— treat narrative writing messages as creative exercises, not real events.'). "
             "The other agent will see your note on their very next activation.\n\n"
+            "## Querying other agents\n"
+            "Use query_agent(to_agent, question) when another domain's synthesized "
+            "judgment would materially improve your response — before building a "
+            "multi-day plan, or when a cross-domain pattern is central to your analysis. "
+            "Use it instead of notes_recent when you need reasoning, not just raw data. "
+            "Do not call query_agent for simple or short exchanges — only when the "
+            "other agent's response would genuinely change your output.\n\n"
             + _load_prompt("grill")
+            + "\n\n"
+            + _load_prompt("clarify")
+            + "\n\n"
+            + _load_prompt("alerts")
         ),
     ]
 
     # Recent notes for this agent's domain.
-    # The router can return a fine-grained category (e.g. "running", "sleep")
-    # that is not an agent name.  Notes are only stored under agent names
-    # (note_add constrains to _AGENTS; agent_handoff writes to the target
-    # agent name).  So we always need to query by the agent name — use the
-    # fine-grained category only when it happens to be a valid agent name
-    # itself, and fall back to the agent name otherwise.
+    # Notes are stored under agent names (log_note uses the agent/category from
+    # dispatch).  Use the fine-grained category only when it matches a valid
+    # agent name; otherwise fall back to the agent name.
+    # Inject recent notes for this agent's domain.
+    # Only user messages (role='user') and cross-agent handoffs (role='system')
+    # are included — the agent's own past responses are already in
+    # agent_message_history() and would be noisy/redundant here.
+    # role IS NULL covers legacy notes created before the role column was added.
     from .discovery import get_agents
     _agents = get_agents()
-    note_category = category if category in _agents else agent
-    if note_category in _agents:
+    if agent in _agents:
         with db._connect() as conn:
             rows = conn.execute(
                 "SELECT ts, summary, raw_text FROM notes "
-                "WHERE category = ? ORDER BY ts DESC LIMIT 20",
-                (note_category,),
+                "WHERE category = ? "
+                "AND (role IN ('user', 'system') OR role IS NULL) "
+                "ORDER BY ts DESC LIMIT 20",
+                (agent,),
             ).fetchall()
         if rows:
-            note_lines = "\n".join(
-                f"- [{datetime.datetime.fromtimestamp(r[0]).strftime('%a %b %d')}] {r[1]}"
-                for r in rows
+            today_date = datetime.date.today()
+            note_lines = []
+            for r in rows:
+                note_date = datetime.datetime.fromtimestamp(r[0]).date()
+                days_ago = (today_date - note_date).days
+                if days_ago == 0:
+                    age = "today"
+                elif days_ago == 1:
+                    age = "yesterday"
+                elif days_ago <= 6:
+                    age = f"{days_ago}d ago"
+                else:
+                    age = f"{days_ago // 7}w ago"
+                date_str = datetime.datetime.fromtimestamp(r[0]).strftime('%a %b %d')
+                note_lines.append(f"- [{date_str}, {age}] {r[1]}")
+            parts.append(
+                f"## Recent {agent} notes\n"
+                f"_(Notes marked '1w ago' or older may not reflect Xi's current situation. "
+                f"Verify their relevance before citing as current context.)_\n"
+                + "\n".join(note_lines)
             )
-            parts.append(f"## Recent {note_category} notes\n{note_lines}")
 
     # For the workout agent: add a pre-extracted weight table so the LLM doesn't
     # need to parse weights out of session notes. Weight is owned by the workout
@@ -323,6 +350,7 @@ def _build_agent_context(agent: str, category: str) -> str:
             w_rows = conn.execute(
                 "SELECT ts, raw_text, summary FROM notes "
                 "WHERE category = 'workout' "
+                "AND (role IN ('user', 'system') OR role IS NULL) "
                 "AND (raw_text LIKE '%kg%' OR summary LIKE '%kg%') "
                 "ORDER BY ts ASC",
             ).fetchall()
@@ -363,7 +391,8 @@ def _build_agent_context(agent: str, category: str) -> str:
     # Inject any stored conversation summary (older turns compressed into a paragraph).
     # Recent raw turns are passed as OpenAI messages by dispatch.py; the summary
     # covers everything older than the rolling window so nothing is silently lost.
-    summary_data = get_agent_summary(agent)
+    # General agent is excluded from summarisation.
+    summary_data = None if agent == "general" else get_agent_summary(agent)
     if summary_data and summary_data["summary"]:
         ts_from = datetime.datetime.utcfromtimestamp(summary_data["ts_from"]).strftime("%b %d")
         ts_to   = datetime.datetime.utcfromtimestamp(summary_data["ts_to"]).strftime("%b %d")
@@ -405,7 +434,8 @@ def agent_message_history(agent: str, limit: int = 20) -> list[dict[str, str]]:
     """Return the most recent `limit` agent turns as OpenAI-format messages.
 
     Reads from messages WHERE agent=?, only turns after the last /reset.
-    GROUP BY (role, content) collapses accidental duplicates; MAX(ts) orders.
+    Ordered by ts DESC so the most recent turns are returned, then reversed
+    to restore chronological order for the LLM.
 
     Any non-user/assistant rows (e.g. [CONFIRMED] system notes tagged to this
     agent) are mapped to the 'assistant' role so they don't appear as a second
@@ -417,8 +447,7 @@ def agent_message_history(agent: str, limit: int = 20) -> list[dict[str, str]]:
             SELECT role, content
             FROM messages
             WHERE agent = ? AND ts > {_RESET_CUTOFF_SQL}
-            GROUP BY role, content
-            ORDER BY MAX(ts) DESC LIMIT ?
+            ORDER BY ts DESC LIMIT ?
             """,
             (agent, limit),
         ).fetchall()
@@ -467,11 +496,9 @@ def summarise_if_needed(agent: str) -> bool:
     with db._connect() as conn:
         total = conn.execute(
             f"""
-            SELECT COUNT(*) FROM (
-                SELECT role, content FROM messages
-                WHERE agent = ? AND ts > {_RESET_CUTOFF_SQL}
-                GROUP BY role, content
-            )
+            SELECT COUNT(*) FROM messages
+            WHERE agent = ? AND ts > {_RESET_CUTOFF_SQL}
+            AND role IN ('user', 'assistant')
             """,
             (agent,),
         ).fetchone()[0]
@@ -496,11 +523,11 @@ def summarise_if_needed(agent: str) -> bool:
         with db._connect() as conn:
             delta_rows = conn.execute(
                 f"""
-                SELECT MAX(ts) as ts, role, content
+                SELECT ts, role, content
                 FROM messages
                 WHERE agent = ? AND ts > {_RESET_CUTOFF_SQL}
-                GROUP BY role, content
-                ORDER BY MAX(ts) DESC LIMIT ?
+                AND role IN ('user', 'assistant')
+                ORDER BY ts DESC LIMIT ?
                 """,
                 (agent, _RECENT_TURNS),
             ).fetchall()
@@ -518,11 +545,11 @@ def summarise_if_needed(agent: str) -> bool:
         with db._connect() as conn:
             all_rows = conn.execute(
                 f"""
-                SELECT MAX(ts) as ts, role, content
+                SELECT ts, role, content
                 FROM messages
                 WHERE agent = ? AND ts > {_RESET_CUTOFF_SQL}
-                GROUP BY role, content
-                ORDER BY MAX(ts) ASC
+                AND role IN ('user', 'assistant')
+                ORDER BY ts ASC
                 """,
                 (agent,),
             ).fetchall()

@@ -49,12 +49,11 @@ from telegram.ext import (
 
 from . import audit
 from .config import AGENT_TEMPERATURE, ALLOWED_USERS, DEEPSEEK_MODEL, HISTORY_TURNS, LOG_LEVEL, MAX_TOOL_TURNS, TELEGRAM_BOT_TOKEN, WHISPER_API_KEY, WHISPER_API_URL, SHOW_TOOL_CALLS, SHOW_REASONING, REASONING_MAX_CHARS
-from .db import init as db_init, log_message, recent_history, tag_last_exchange, tag_message
+from .db import init as db_init, log_message, log_note, recent_history, tag_last_exchange, tag_message
 from .db import _connect as _db_connect
 from .llm import format_debug_header, format_staged_footer, format_write_confirmation
 from .tools import pending  # ensures pending table is created
 from .agents.dispatch import handle as agent_handle
-from .weekly_summary import check_and_send as _check_weekly_summaries
 from .reminders import check_due_reminders
 
 
@@ -119,6 +118,10 @@ def _setup_logging() -> None:
 
     root = logging.getLogger()
     root.setLevel(LOG_LEVEL)
+
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("telegram.ext.ExtBot").setLevel(logging.WARNING)
 
     # Console — human-readable, respects LOG_LEVEL
     console = logging.StreamHandler()
@@ -210,13 +213,40 @@ if prompt_tools:
     EXECUTORS["prompt_replace_section"] = prompt_tools.execute_confirmed
     EXECUTORS["prompt_add_section"]     = prompt_tools.execute_confirmed
 if reminder_tools:
-    EXECUTORS["reminder_set"] = reminder_tools.execute_confirmed
+    EXECUTORS["reminder_set"]  = reminder_tools.execute_confirmed
+    EXECUTORS["reminder_once"] = reminder_tools.execute_confirmed
 if todo_tools:
     EXECUTORS["todo_add"]    = todo_tools.execute_confirmed
     EXECUTORS["todo_done"]   = todo_tools.execute_confirmed
     EXECUTORS["todo_delete"] = todo_tools.execute_confirmed
 if diary_tools:
     EXECUTORS["diary_add"] = diary_tools.execute_confirmed
+
+
+# ---------------------------------------------------------------------------
+# Duplicate-update guard
+# ---------------------------------------------------------------------------
+
+# Telegram long-polling can re-deliver the same update_id when the bot takes
+# too long to respond and the network times out. Without dedup, the agent runs
+# twice on the same message, producing two identical responses. We cache the
+# last N update_ids in memory; the set is never persisted (a restart clears it)
+# which is fine — restarts are rare and a single double-reply on restart is
+# acceptable compared to the complexity of persistent dedup.
+_SEEN_UPDATES: set[int] = set()
+_SEEN_UPDATES_MAX = 500
+
+
+def _is_duplicate_update(update_id: int) -> bool:
+    if update_id in _SEEN_UPDATES:
+        return True
+    _SEEN_UPDATES.add(update_id)
+    if len(_SEEN_UPDATES) > _SEEN_UPDATES_MAX:
+        # Evict the oldest half to keep the set bounded.
+        oldest = sorted(_SEEN_UPDATES)[: _SEEN_UPDATES_MAX // 2]
+        for uid in oldest:
+            _SEEN_UPDATES.discard(uid)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -345,8 +375,14 @@ async def cmd_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(msg)
         return
 
-    # --- Bare confirm → execute the whole pending batch ---
-    actions = pending.all_pending_for(user_id)
+    # --- Bare confirm → execute only the most-recent batch ---
+    # First retire any abandoned stages (un-confirmed > 1h) so an old backlog
+    # can never be swept into this confirm.
+    expired = pending.expire_stale(user_id)
+    if expired:
+        log.info("Expired %d stale pending actions for user %s", expired, user_id)
+
+    actions = pending.recent_batch_for(user_id)
     if not actions:
         await update.message.reply_text("No pending actions to confirm.")
         return
@@ -408,6 +444,9 @@ async def handle_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle every plain-text message: route through the agent system and reply."""
     msg = update.message
     if msg is None:
+        return
+    if _is_duplicate_update(update.update_id):
+        log.warning("Duplicate update_id=%s — skipping re-delivery", update.update_id)
         return
     if not _allowed(update):
         log.warning(
@@ -493,8 +532,8 @@ async def _run_agent_pipeline(
             sections.append(format_debug_header(turn_invocations))
         else:
             # When SHOW_TOOL_CALLS is off, still surface write confirmations
-            # (note_add, diary_add, todo_add, agent_handoff) so the user has
-            # ground-truth proof data was saved — independent of the debug flag.
+            # (diary_add, todo_add, agent_handoff) so the user has ground-truth
+            # proof data was saved — independent of the debug flag.
             # Skipped when SHOW_TOOL_CALLS is on because the full header already
             # covers these tools, and showing them twice is just noise.
             write_conf = format_write_confirmation(turn_invocations)
@@ -529,6 +568,16 @@ async def _run_agent_pipeline(
     log_message(user_id, "assistant", result.text)
     agent_tag = routed_agent if routed_agent != "none" else "general"
     tag_last_exchange(user_id, agent_tag)
+
+    # Auto-store both turns in the notes table under the agent's category.
+    # This replaces the old note_add tool-call pattern — every conversation turn
+    # is persisted here at the system level so agents never need to do it manually.
+    # Guard: skip empty texts (tool-only turns occasionally produce no final text).
+    if text.strip():
+        log_note(agent_tag, "user", text)
+    if result.text.strip():
+        log_note(agent_tag, "assistant", result.text)
+
     staged_ids = [
         i.result.get("action_id")
         for i in result.invocations
@@ -546,7 +595,7 @@ async def _run_agent_pipeline(
     # explicit first-person claim of a completed write action:
     #   "I saved …", "I've logged …", "I added …", "I recorded …", etc.
     _write_tools = {
-        "todo_add", "note_add", "diary_add",
+        "todo_add", "diary_add",
         "file_write", "file_append", "file_edit",
         "calendar_create_event", "gmail_send_message",
         "notion_archive_page",
@@ -593,12 +642,6 @@ async def _run_agent_pipeline(
     if staged_footer:
         await msg.reply_text(staged_footer)
 
-    # Fire weekly summary check in the background — after the user's reply
-    # is already sent so it never adds latency to the conversation.
-    async def _send(text: str) -> None:
-        await msg.reply_text(text)
-
-    asyncio.create_task(_check_weekly_summaries(user_id, _send))
 
 
 # ---------------------------------------------------------------------------
@@ -616,6 +659,9 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
     msg = update.message
     if msg is None:
+        return
+    if _is_duplicate_update(update.update_id):
+        log.warning("Duplicate update_id=%s (voice) — skipping re-delivery", update.update_id)
         return
     if not _allowed(update):
         await msg.reply_text("Not authorized.")
@@ -695,7 +741,7 @@ def _assemble_reply(result) -> str:
     sections.append(result.text or "")
 
     # Only show write confirmations when the full debug header is off —
-    # otherwise note_add / agent_handoff appear twice.
+    # otherwise diary_add / agent_handoff / todo_add appear twice.
     if not SHOW_TOOL_CALLS:
         write_conf = format_write_confirmation(result.invocations)
         if write_conf:

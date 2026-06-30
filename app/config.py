@@ -66,7 +66,7 @@ DEEPSEEK_BASE_URL: str = os.environ.get(
 # 0.0 = fully deterministic, 1.0 = most varied. 0.9 is a good default for a
 # personal assistant — creative enough to feel natural, not so random it hallucinates.
 # Lower this (e.g. 0.5) if you want more focused, conservative answers.
-AGENT_TEMPERATURE: float = float(os.environ.get("AGENT_TEMPERATURE", "0.8"))
+AGENT_TEMPERATURE: float = float(os.environ.get("AGENT_TEMPERATURE", "0.5"))
 
 # Maximum number of tool-call iterations per user message. Each iteration is
 # one LLM call + its tool calls. Most questions resolve in 1–3 turns; the cap
@@ -93,14 +93,6 @@ CONVERSATION_SUMMARY_THRESHOLD: int = int(
     os.environ.get("CONVERSATION_SUMMARY_THRESHOLD", "40")
 )
 
-# Default agent for diary entries when the router returns agent=none.
-# Override if you've replaced or renamed the growth agent.
-DIARY_DEFAULT_AGENT: str = os.environ.get("DIARY_DEFAULT_AGENT", "growth")
-
-# Default agent for grill sessions when the router returns agent=none
-# (e.g. bare "grill me" with no domain specified).
-# Growth is the most natural default for open-ended self-challenge.
-GRILL_DEFAULT_AGENT: str = os.environ.get("GRILL_DEFAULT_AGENT", "growth")
 
 # Timezone for week boundary calculations (weekly summaries).
 # Weekly summaries are generated on Monday 00:00 in this timezone.

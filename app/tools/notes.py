@@ -10,7 +10,6 @@ from .registry import tool
 
 # Build dynamic enum lists once at module load (per-process, matches discovered agents).
 _AGENTS        = list(get_agents())
-_CATEGORIES    = _AGENTS + ["uncategorized"]
 _CATEGORIES_EX = _AGENTS + ["uncategorized", "all"]   # includes 'all' for filter tools
 _AGENTS_EX     = _AGENTS + ["all"]                    # includes 'all' for feedback_recent
 
@@ -19,56 +18,11 @@ _AGENTS_EX     = _AGENTS + ["all"]                    # includes 'all' for feedb
 # Notes
 # ---------------------------------------------------------------------------
 
-_DEDUP_WINDOW_SECONDS = 600  # 10 minutes
-
-
 @tool(
     description=(
-        "Store a note with a category and summary. Returns the new note id.\n\n"
-        "Deduplication: if the exact same text was already stored in the same "
-        "category within the last 10 minutes, the existing note is returned "
-        "instead of creating a duplicate."
-    ),
-    parameters={
-        "type": "object",
-        "properties": {
-            "text":     {"type": "string", "description": "The original raw text of the note."},
-            "category": {"type": "string", "enum": _CATEGORIES,
-                         "description": "Agent domain this note belongs to, or 'uncategorized'."},
-            "summary":  {"type": "string", "description": "One-sentence summary, max 20 words."},
-        },
-        "required": ["category", "summary"],
-    },
-)
-def note_add(text: str = "", category: str = "uncategorized", summary: str = "") -> dict[str, Any]:
-    """Insert a classified note, skipping exact duplicates within the dedup window."""
-    # LLM occasionally omits text or summary — fall back gracefully rather than crashing.
-    if not text.strip():
-        text = summary
-    if not summary.strip():
-        summary = text[:100]
-    if not text.strip():
-        return {"ok": False, "error": "note_add requires at least text or summary"}
-    cutoff = int(time.time()) - _DEDUP_WINDOW_SECONDS
-    with _connect() as conn:
-        existing = conn.execute(
-            "SELECT id FROM notes "
-            "WHERE category = ? AND raw_text = ? AND ts >= ?",
-            (category, text, cutoff),
-        ).fetchone()
-        if existing:
-            return {"ok": True, "id": existing[0], "category": category, "duplicate": True}
-        cur = conn.execute(
-            "INSERT INTO notes(ts, created_at, raw_text, category, summary) VALUES (?,?,?,?,?)",
-            (int(time.time()), _utc_now(), text, category, summary),
-        )
-    return {"ok": True, "id": cur.lastrowid, "category": category}
-
-
-@tool(
-    description=(
-        "Retrieve recent notes, optionally filtered by category. "
-        "Returns notes in reverse-chronological order."
+        "Retrieve recent notes for a domain, optionally filtered by category. "
+        "Returns user-logged entries and cross-agent handoff notes in reverse-chronological order. "
+        "Agent responses are excluded — use conversation_recent for full dialogue history."
     ),
     parameters={
         "type": "object",
@@ -84,19 +38,26 @@ def note_add(text: str = "", category: str = "uncategorized", summary: str = "")
     },
 )
 def notes_recent(category: str = "all", limit: int = 10) -> dict[str, Any]:
-    """Return the most recent notes, optionally filtered to a single category."""
+    """Return the most recent user-logged notes, optionally filtered to a single category.
+
+    Excludes assistant responses (role='assistant') — those are in agent_message_history.
+    Includes user messages (role='user'), cross-agent handoffs (role='system'),
+    and legacy rows (role IS NULL) created before the role column was added.
+    """
     limit = min(max(1, limit), 50)
     with _connect() as conn:
         if category == "all":
             rows = conn.execute(
                 "SELECT id, ts, category, summary, raw_text FROM notes "
+                "WHERE role != 'assistant' OR role IS NULL "
                 "ORDER BY ts DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         else:
             rows = conn.execute(
                 "SELECT id, ts, category, summary, raw_text FROM notes "
-                "WHERE category = ? ORDER BY ts DESC LIMIT ?",
+                "WHERE category = ? AND (role != 'assistant' OR role IS NULL) "
+                "ORDER BY ts DESC LIMIT ?",
                 (category, limit),
             ).fetchall()
     return {
@@ -109,7 +70,8 @@ def notes_recent(category: str = "all", limit: int = 10) -> dict[str, Any]:
 
 @tool(
     description=(
-        "Full-text search across notes. Searches raw text and summaries. "
+        "Full-text search across notes. Searches user-logged entries and cross-agent handoffs. "
+        "Agent responses are excluded from search results. "
         "Optionally filter by category."
     ),
     parameters={
@@ -127,21 +89,26 @@ def notes_recent(category: str = "all", limit: int = 10) -> dict[str, Any]:
     },
 )
 def notes_search(query: str, category: str = "all", limit: int = 10) -> dict[str, Any]:
-    """Keyword-search raw note text and summaries using SQLite LIKE."""
+    """Keyword-search user-logged notes using SQLite LIKE.
+
+    Excludes assistant responses (role='assistant').
+    """
     limit = min(max(1, limit), 50)
     like = f"%{query}%"
     with _connect() as conn:
         if category == "all":
             rows = conn.execute(
                 "SELECT id, ts, category, summary, raw_text FROM notes "
-                "WHERE raw_text LIKE ? OR summary LIKE ? "
+                "WHERE (role != 'assistant' OR role IS NULL) "
+                "AND (raw_text LIKE ? OR summary LIKE ?) "
                 "ORDER BY ts DESC LIMIT ?",
                 (like, like, limit),
             ).fetchall()
         else:
             rows = conn.execute(
                 "SELECT id, ts, category, summary, raw_text FROM notes "
-                "WHERE category = ? AND (raw_text LIKE ? OR summary LIKE ?) "
+                "WHERE category = ? AND (role != 'assistant' OR role IS NULL) "
+                "AND (raw_text LIKE ? OR summary LIKE ?) "
                 "ORDER BY ts DESC LIMIT ?",
                 (category, like, like, limit),
             ).fetchall()

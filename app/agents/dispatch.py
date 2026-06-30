@@ -4,12 +4,9 @@ Every message from main.py flows through handle() here. This module owns the
 full pipeline from raw text to ChatResult:
 
   1. Router classification
-     router.route(message) → {type, agent, category}
-     - "note"  → store to DB immediately; agent responds without note_add tool
-     - "diary" → agent handles everything (diary_add + note_add + response)
-     - "chat"  → normal conversation with the matched specialist agent
-     - "grill" → agent switches to examiner mode (one question at a time, feedback, weak-spot notes)
+     router.route(message) → {agent}
      - agent == "none" → general LLM with no specialist persona
+     - agent == specialist → routed to that agent's persona + context
 
   2. Sticky-agent fallback
      Short ambiguous messages (≤ 5 words: "Yes", "OK", "Go ahead") are
@@ -40,24 +37,15 @@ from typing import Callable
 from .. import audit, db, debug_log
 from ..config import (
     DEBUG_LOG_AGENT_PROMPT, DEBUG_LOG_DISPATCH,
-    DIARY_DEFAULT_AGENT, GRILL_DEFAULT_AGENT,
     SHOW_AGENT_NAME,
 )
 from ..db import _utc_now
 from ..llm import ChatResult, ToolInvocation, chat
-from ..tools.notes import note_add as _note_add
 from . import router as _router
-from .discovery import get_agents as _get_agents
 
 log = logging.getLogger(__name__)
 
 PROMPTS_DIR = Path(__file__).parent.parent.parent / "data" / "prompts"
-
-# Messages at or below this word count are considered "ambiguous" and trigger
-# the sticky-agent fallback. Not in config — it's a routing logic detail, not
-# a user-facing tuning knob.
-_STICKY_WORD_LIMIT = 5
-
 
 def _today() -> str:
     """Return today's date as a human-readable string, e.g. 'Tuesday, May 13, 2026'.
@@ -73,19 +61,37 @@ def _build_general_prompt() -> str:
     return (
         f"Today is {_today()}. Use this for ALL date and calendar calculations — "
         "never guess the year from training data.\n\n"
-        "You are Xi's personal assistant. Be concise, direct, and never sycophantic.\n"
+        "You are Xi's general-purpose personal assistant. You are NOT a specialist "
+        "agent — not workout, not lifestyle, not growth, not career, not dutch. "
+        "Never claim to belong to any specialist domain, even if the recent "
+        "conversation was in that domain.\n\n"
+        "When Xi says a message should go to a specialist agent, do NOT call "
+        "agent_handoff — that is an async note, not a re-route. Instead, tell Xi "
+        "to re-send their log clearly (e.g. '7h sleep' or '70.5kg') so the system "
+        "routes it automatically to the right specialist.\n\n"
+        "Be concise, direct, and never sycophantic.\n"
         "\n"
         "When asked what tools you have, call tool_need() or check the structured tool "
         "list available to you — never claim you have no tools or make up capabilities. "
         "When asked about personal data (emails, calendar, Notion pages, files), "
         "call the relevant tool instead of guessing or refusing.\n"
         "\n"
+        "## Response format\n"
+        "Keep replies conversational, not documentary.\n"
+        "- Default: plain prose or short bullets. No ## section headers, no --- dividers, "
+        "no markdown tables in a normal reply.\n"
+        "- Structure (tables, headers, breakdowns) only when Xi explicitly asks for an "
+        "analysis, plan, or report.\n"
+        "- Length: ≤250 words for a typical reply. Expand only when the question genuinely "
+        "requires it — not by habit.\n"
+        "- No preamble: start with the answer. Drop openers like 'Here's what I found:' "
+        "or 'Let me break this down.'\n"
+        "\n"
         "## Tool honesty rule — CRITICAL\n"
         "Your text responses NEVER change any data. Only tool calls do.\n"
         "NEVER say something was saved, added, updated, or logged unless you actually "
         "called the relevant tool in this same response and it returned ok.\n"
         "If you want to add a todo item → call todo_add. "
-        "If you want to save a note → call note_add. "
         "If you want to write a file → call file_write or file_append. "
         "Saying 'Done!' without calling the tool is a lie — do not do it.\n"
         "\n"
@@ -94,7 +100,26 @@ def _build_general_prompt() -> str:
         "IMPORTANT: call the tool NOW in your current turn — never say 'reply and I'll "
         "create it' and skip the tool call. For multiple items (e.g. 3 calendar events), "
         "call the tool once per item in the same turn. After staging, tell the user what "
-        "was staged and end with: 'Reply confirm to execute or cancel to discard.'"
+        "was staged and end with: 'Reply confirm to execute or cancel to discard.'\n"
+        "\n"
+        "## Declare missing capabilities BEFORE acting — CRITICAL\n"
+        "Before producing any plan, proposal, or analysis that depends on a tool, "
+        "call that tool first. If the tool returns an error or auth failure, say so "
+        "explicitly at the top of your response BEFORE the plan: "
+        "'⚠️ [tool] unavailable ([reason]) — proceeding without it.'\n"
+        "NEVER silently omit a constraint you can't verify. Concretely:\n"
+        "- Planning a workout schedule? Call calendar_list_events() first. "
+        "If it fails, state '⚠️ Calendar unavailable — I can't check your real schedule. "
+        "Tell me your blocked days and I'll plan around those.'\n"
+        "- Making a recommendation based on history? Call notes_recent() first. "
+        "If there are no notes, say so — don't fabricate a history.\n"
+        "This rule also applies to specialist agents standing in for each other.\n"
+        "\n"
+        # The general agent handles generic reminders ("remind me to get grocery
+        # at 5pm Tuesday") that carry no specialist signal, so it needs the same
+        # alerts guidance the specialists get. Injected dynamically rather than
+        # duplicated inline so there's a single source of truth in skills/alerts.md.
+        + _router._load_prompt("alerts")
     )
 
 
@@ -119,28 +144,18 @@ _NOTION_TOOLS = frozenset({
     "notion_search", "notion_get_page", "notion_append_paragraph",
     "notion_create_page", "notion_archive_page",
 })
-_HEALTH_TOOLS = frozenset({
-    "health_daily_summary", "health_sport_breakdown",
-    "health_heart_rate", "health_workout_sessions",
-})
 
 # Capability group → set of agents allowed to use it. Agents absent from a
 # group's set have that group's tools excluded.
 _GROUP_ALLOW: dict[str, frozenset[str]] = {
     "gmail":  frozenset({"career", "general"}),
     "notion": frozenset({"career", "general"}),
-    "health": frozenset({"workout", "general"}),
 }
 _GROUP_TOOLS: dict[str, frozenset[str]] = {
     "gmail":  _GMAIL_TOOLS,
     "notion": _NOTION_TOOLS,
-    "health": _HEALTH_TOOLS,
 }
-# Agents granted only a subset of a group's tools (finer than group-level).
-# Lifestyle tracks daily activity but doesn't need the full sports breakdown.
-_GROUP_PARTIAL: dict[tuple[str, str], frozenset[str]] = {
-    ("health", "lifestyle"): frozenset({"health_daily_summary"}),
-}
+_GROUP_PARTIAL: dict[tuple[str, str], frozenset[str]] = {}
 
 
 def _excluded_tools_for(agent: str) -> frozenset[str]:
@@ -162,18 +177,17 @@ def _excluded_tools_for(agent: str) -> frozenset[str]:
     return frozenset(excluded)
 
 
-# Only inherit the last agent if a conversation happened within this window.
-# Prevents stale inheritance — e.g. a workout conversation from this morning
-# should not pull in an unrelated "yes" response this evening.
-_STICKY_MAX_AGE_SECONDS = 3600  # 1 hour
+# Only read back recent agent history within this window — prevents a
+# workout conversation from this morning polluting an unrelated evening session.
+_RECENT_AGENT_WINDOW = 3600  # 1 hour
 
 
-def _last_used_agent() -> tuple[str | None, str]:
-    """Return (agent_name, 'chat') for the most recently active conversation.
+def _last_used_agent() -> str | None:
+    """Return the most recently active specialist agent name, or None.
 
-    Reads from messages.agent. Excludes 'general' — it's a pass-through, not a
-    specialist. Returns (None, 'chat') when no recent conversation exists or the
-    last one is older than _STICKY_MAX_AGE_SECONDS (1 hour).
+    Excludes 'general' — it's a pass-through, not a specialist.
+    Returns None when no recent conversation exists or the last one is
+    older than _RECENT_AGENT_WINDOW (1 hour).
     """
     with db._connect() as conn:
         row = conn.execute(
@@ -186,11 +200,11 @@ def _last_used_agent() -> tuple[str | None, str]:
             """
         ).fetchone()
     if not row:
-        return None, "chat"
+        return None
     agent, ts = row
-    if (time.time() - ts) > _STICKY_MAX_AGE_SECONDS:
-        return None, "chat"
-    return agent, "chat"  # grill is now an agent skill — no special msg_type needed
+    if (time.time() - ts) > _RECENT_AGENT_WINDOW:
+        return None
+    return agent
 
 
 def handle(
@@ -204,21 +218,14 @@ def handle(
     Returns (ChatResult, agent_name). agent_name is 'none' for general messages.
     The caller persists turns to db.messages and tags them via tag_last_exchange().
 
-    Routing strategy:
-      1. Ask the router to classify the message, passing the last-used agent as
-         a context hint so short replies ("Yes", "OK") resolve correctly.
-      2. Sticky fallback: if the router still returns agent=none AND the message
-         is ≤ 5 words AND there is a recent agent conversation, inherit that agent.
-         This handles bare acknowledgements like "confirm" or "go ahead".
+    The router receives the last 3 conversation exchanges as history so it can
+    resolve follow-ups, corrections, and topic switches on its own.
     """
-    last_agent, last_msg_type = _last_used_agent()
+    last_agent = _last_used_agent()
 
     # Pass the last 3 turns from the messages table as structured history so
     # the router can resolve corrections ("that's wrong"), follow-ups, and
     # mid-conversation topic switches that carry no domain signal on their own.
-    # The messages table includes the general agent's turns — the old one-line
-    # hint only tracked the last
-    # specialist, so corrections about general-agent responses went to the wrong agent.
     router_history: list[dict] = []
     with db._connect() as _conn:
         _rows = _conn.execute(
@@ -234,111 +241,28 @@ def handle(
     for role, content in reversed(_rows):
         router_history.append({"role": role, "content": content[:400]})
 
-    route = _router.route(user_message, history=router_history or None)
-    msg_type = route.get("type", "chat")
-    agent    = route.get("agent", "none")
-    # Normalise category: router may return "none" for chat-type messages;
-    # use "uncategorized" as the canonical unknown-category value throughout.
-    category = route.get("category") or "uncategorized"
+    route = _router.route(user_message, history=router_history)
+    agent = route.get("agent", "none")
 
-    # Sticky-agent fallback: short ambiguous messages (≤ _STICKY_WORD_LIMIT words)
-    # that the router can't classify (e.g. "Yes", "OK", "Let's do it") are
-    # inherited by the last active agent.
-    #
-    # Grill exception: during an active grill session answers can be long
-    # ("I think the verb moves to the end because it's a subordinate clause").
-    # When the last stored turn was grill we skip the word-count check entirely
-    # so every answer — regardless of length — stays with the correct specialist.
-    sticky_fired = False
-    if agent == "none" and last_agent:
-        if len(user_message.split()) <= _STICKY_WORD_LIMIT:
-            log.debug(
-                "Sticky agent fallback: '%s' → continuing %s agent",
-                user_message, last_agent,
-            )
-            agent = last_agent
-            sticky_fired = True
+    log.debug("Route: agent=%s", agent)
 
-    log.debug("Route: type=%s agent=%s category=%s", msg_type, agent, category)
-
-    # Log the final dispatch decision (after sticky fallback) so the audit log
-    # shows the complete picture: route_decision = raw router output,
-    # dispatch = what actually ran.
     audit.log_event(
         "dispatch",
         user_id=user_id,
-        type=msg_type,
         agent=agent,
-        category=category,
-        sticky_fallback=sticky_fired,
-        # When sticky fallback fires, router_agent shows what the router
-        # originally returned before the override — useful for diagnosing
-        # whether the router was wrong or the fallback was correct.
-        router_agent=route.get("agent", "none"),
         last_agent=last_agent,
     )
 
-    # Debug: full routing decision with all context so every dispatch is traceable.
     if DEBUG_LOG_DISPATCH:
         _domain_excluded = _excluded_tools_for(agent)
         debug_log.log(
             "debug_dispatch",
             user_message=user_message[:200],
-            msg_type=msg_type,
-            router_agent=route.get("agent", "none"),
             resolved_agent=agent,
-            category=category,
-            sticky_fired=sticky_fired,
             last_agent=last_agent,
             tools_excluded=sorted(_domain_excluded),
             tools_excluded_count=len(_domain_excluded),
         )
-
-    # --- Note intake ---
-    if msg_type == "note":
-        # Use the router's category when it's a valid agent name.
-        # Fall back to the (sticky-resolved) agent name when the router said
-        # "none"/"uncategorized" — e.g. the router couldn't classify the agent
-        # but sticky overrode it to "workout", so the note belongs to workout.
-        _raw_cat = route.get("category") or "uncategorized"
-        note_category = _raw_cat if _raw_cat in _get_agents() else (
-            agent if agent != "none" else "uncategorized"
-        )
-        note_summary = route.get("summary") or user_message[:80]
-
-        # Route through note_add() so the deduplication guard fires — prevents
-        # double-storing the same message when the agent also calls note_add.
-        _note_add(text=user_message, category=note_category, summary=note_summary)
-        audit.log_event(
-            "note_stored",
-            user_id=user_id,
-            category=note_category,
-            summary=note_summary,
-        )
-
-        # Notes can also contain an action (e.g. "schedule a workout tomorrow").
-        # If there's an agent, route to it for a response; otherwise ack simply.
-        if agent == "none":
-            ack = f"Got it — logged as {note_category}: {note_summary}"
-            # Tagging handled by main.py via tag_last_exchange().
-            return ChatResult(text=ack), "none"
-
-    # --- Diary intake ---
-    # Diary entries are routed to the relevant agent, which is responsible for:
-    #   1. Calling diary_add (writes the raw narrative to diary.md)
-    #   2. Optionally calling note_add, todo_add, etc. to extract structured items
-    #   3. Responding to the user
-    # We don't pre-store anything here — the agent drives the whole flow via tools.
-    # When the router can't assign a specific agent (agent=="none"), we fall back to
-    # the lifestyle agent, since diary entries are almost always personal narrative.
-    if msg_type == "diary":
-        if agent == "none":
-            agent = DIARY_DEFAULT_AGENT
-            log.debug("Diary entry with no specific agent — defaulting to %s agent", agent)
-
-    # Grill mode is now an agent skill — every agent's context block contains
-    # grill instructions and the agent decides when to switch modes.
-    # No special routing needed here.
 
     # --- General (no specific agent) ---
     if agent == "none":
@@ -358,30 +282,13 @@ def handle(
     # Must run BEFORE _build_persona so the summary is already stored when
     # _build_agent_context() calls get_agent_summary() to inject it into the
     # system prompt this same call.
-    did_summarise = _router.summarise_if_needed(agent)
+    # General agent is excluded: its history is too broad to summarise usefully.
+    did_summarise = False if agent == "general" else _router.summarise_if_needed(agent)
 
-    persona_prompt = _build_persona(agent, category)
+    persona_prompt = _build_persona(agent)
     agent_history = _router.agent_message_history(agent, limit=20)
 
-    # For diary entries, prepend a hidden system note so the agent knows to call
-    # diary_add. Without this, the agent receives the same input as a normal
-    # conversation message and has no signal to write to diary.md.
-    if msg_type == "diary":
-        content_for_agent = (
-            "[Diary entry detected — follow this order:\n"
-            "1. Call diary_add() to write the narrative to diary.md.\n"
-            "2. Call note_add(category=<most relevant category>, summary=<one sentence>) "
-            "so the entry appears in your context on future calls. "
-            "Without this, the diary entry won't be visible in future conversations.\n"
-            "3. If any actionable items are present (todos, goals), call todo_add / "
-            "file_append as appropriate.\n"
-            "4. Then respond naturally.]\n\n"
-            + user_message
-        )
-    else:
-        # type == "note": note already stored by dispatch; note_add excluded below.
-        # type == "chat": plain conversation, no special wrapping needed.
-        content_for_agent = user_message
+    content_for_agent = user_message
 
     # Recent cross-agent context: give this agent the last few turns that were
     # handled by OTHER agents (general or another specialist), so it knows what
@@ -426,12 +333,8 @@ def handle(
     # Merge: start from agent's own history, append the new user message.
     messages_for_agent = [*agent_history, {"role": "user", "content": content_for_agent}]
 
-    # Build the combined exclusion set:
-    #   1. note_add excluded when the note is pre-stored by dispatch (avoids duplicate)
-    #   2. Domain-specific tools irrelevant to this agent (reduces schema size + noise)
-    note_excluded = frozenset({"note_add"}) if msg_type == "note" else frozenset()
-    domain_excluded = _excluded_tools_for(agent)
-    excluded = note_excluded | domain_excluded
+    # Exclude domain-specific tools irrelevant to this agent (reduces schema size + noise).
+    excluded = _excluded_tools_for(agent)
 
     # Show agent label before the first chunk so the user knows which
     # specialist is responding — fires only when SHOW_AGENT_NAME=true.
@@ -465,7 +368,7 @@ def handle(
     return result, agent
 
 
-def _build_persona(agent: str, category: str) -> str:
+def _build_persona(agent: str) -> str:
     """Combine an agent's persona file with its injected context block.
 
     The persona file (e.g. data/prompts/workout.md) provides the agent's
@@ -473,7 +376,7 @@ def _build_persona(agent: str, category: str) -> str:
     notes, and conversation history — all dynamic, assembled each call.
     """
     agent_prompt = _load_prompt(agent)
-    context = _router._build_agent_context(agent, category)
+    context = _router._build_agent_context(agent)
 
     parts = [agent_prompt]
     if context:

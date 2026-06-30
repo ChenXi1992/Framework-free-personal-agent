@@ -49,8 +49,8 @@ def _today_header(categories: list[str]) -> str:
         "STAGED — nothing is written until the user confirms. "
         "Call this whenever the user shares personal reflections, daily logs, "
         "or any narrative they want kept in their diary. "
-        "After the user confirms, also call note_add, todo_add, or goal-related "
-        "tools to extract any structured items embedded in the text."
+        "After the user confirms, call todo_add or goal-related tools to extract "
+        "any structured items embedded in the text."
     ),
     parameters={
         "type": "object",

@@ -167,11 +167,7 @@ def latest_pending_for(user_id: int) -> dict[str, Any] | None:
 
 
 def all_pending_for(user_id: int) -> list[dict[str, Any]]:
-    """Return every still-pending action for this user, oldest-staged first.
-
-    Used by a bare /confirm to execute a whole batch (e.g. 4 calendar events
-    staged together) in one go, in the order they were created.
-    """
+    """Return every still-pending action for this user, oldest-staged first."""
     with _connect() as conn:
         rows = conn.execute(
             f"SELECT {_SELECT_COLS} FROM pending_actions "
@@ -180,3 +176,52 @@ def all_pending_for(user_id: int) -> list[dict[str, Any]]:
             (user_id,),
         ).fetchall()
     return [_row_to_dict(r) for r in rows]
+
+
+# A bare "confirm" should only execute the batch the user just saw staged —
+# actions staged together in one agent turn (seconds apart). Anything staged
+# more than this many seconds before the newest pending action belongs to an
+# earlier, un-confirmed interaction and must NOT be swept in.
+_BATCH_WINDOW_SECONDS = 300        # 5 minutes
+# Pending actions left un-confirmed longer than this are considered abandoned
+# and auto-cancelled, so they never accumulate or get executed by a later confirm.
+_STALE_AFTER_SECONDS = 3600        # 1 hour
+
+
+def expire_stale(user_id: int, max_age_seconds: int = _STALE_AFTER_SECONDS) -> int:
+    """Auto-cancel pending actions older than max_age. Returns how many expired.
+
+    Prevents day-old un-confirmed stages from lingering and from being executed
+    by a later bare /confirm.
+    """
+    cutoff = int(time.time()) - max_age_seconds
+    with _connect() as conn:
+        cur = conn.execute(
+            "UPDATE pending_actions SET status='cancelled', "
+            "result='expired (un-confirmed > max age)' "
+            "WHERE user_id = ? AND status = 'pending' AND ts < ?",
+            (user_id, cutoff),
+        )
+        return cur.rowcount
+
+
+def recent_batch_for(user_id: int) -> list[dict[str, Any]]:
+    """Return the most-recent batch of pending actions (what a bare confirm runs).
+
+    The batch = all pending actions staged within _BATCH_WINDOW_SECONDS of the
+    newest pending action. This captures a multi-action stage from one turn
+    (e.g. 4 calendar events) while excluding older un-confirmed stragglers.
+    """
+    # Fetch with ts appended so we can apply the recency window.
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT {_SELECT_COLS}, ts FROM pending_actions "
+            "WHERE user_id = ? AND status = 'pending' "
+            "ORDER BY ts ASC, rowid ASC",
+            (user_id,),
+        ).fetchall()
+    if not rows:
+        return []
+    newest_ts = max(r[-1] for r in rows)
+    cutoff = newest_ts - _BATCH_WINDOW_SECONDS
+    return [_row_to_dict(r[:-1]) for r in rows if r[-1] >= cutoff]
